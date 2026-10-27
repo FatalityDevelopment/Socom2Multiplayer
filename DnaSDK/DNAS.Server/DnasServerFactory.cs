@@ -13,6 +13,9 @@ public sealed class DnasServerConfiguration
     public string? Serial;
     public string TicketRoot = "RSA";
     public string? RepositoryUrl;
+
+    /// <summary>Archive region searched first (us-gw, eu-gw or gai-gw); the others are fallbacks.</summary>
+    public string? PreferredRegion;
 }
 
 /// <summary>
@@ -27,7 +30,7 @@ public static class DnasServerFactory
 
         ProofInputPlan? pinnedIdentity = GetPinnedIdentity(configuration);
         DnasResponseProducer responses = new();
-        TicketStore tickets = new(configuration.TicketRoot, configuration.RepositoryUrl);
+        TicketStore tickets = new(configuration.TicketRoot, configuration.RepositoryUrl, configuration.PreferredRegion);
 
         return new DnasSessionRegistry(pinnedIdentity, secondProducer: responses.ProduceSecondReply, finalProducer: responses.ProduceFinalResult, firstProducerFactory: (request, proof) => CreateFirstReplyProducer(request, proof, responses, tickets));
     }

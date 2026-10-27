@@ -8,8 +8,8 @@
 [Bb]in/
 [Oo]bj/
 
-# Runtime data (accounts, DNAS captures, logs) and local overrides
-data/
+# Runtime DNAS captures, logs and local overrides (runtime data goes under bin/ or the /data volume;
+# no data/ rule: on Windows it would also hide Data/<region>/packets)
 PacketLogs/
 *.log
 .env

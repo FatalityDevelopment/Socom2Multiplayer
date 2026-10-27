@@ -3,7 +3,6 @@
 **/.vs/
 **/*.user
 **/*.log
-**/data/
 **/PacketLogs/
 .git/
 .env

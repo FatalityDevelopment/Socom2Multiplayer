@@ -24,14 +24,15 @@
     <Content Include="config.json">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
-    <!-- SOCOM II's original RSA-signed DNAS ticket, copied into the ticket root on start. -->
-    <Content Include="Dnas\Signatures\*.BIN">
+    <!-- Captured DNAS packets (Data/<region>/packets): DnaSDK takes each title's original RSA ticket from them. -->
+    <Content Include="Data\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <!-- DnaSDK's gateway TLS chain and optional RSA moduli, kept in DnaSDK so its updates come straight across. -->
-    <Content Include="..\DnaSDK\TCP.TLS\Certificates\*.pem" Link="Certificates\%(Filename)%(Extension)">
+    <!-- DNAS gateway TLS certificates (cert-us/eu/jp per DnasRegion, ca-cert.pem issuer). -->
+    <Content Include="Certificates\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <!-- DnaSDK's optional RSA moduli (diagnostic ticket decode in <DnasRsaDirectory>/Decoded). -->
     <Content Include="..\DnaSDK\Assets\Moduli\*.BIN" Link="Assets\Moduli\%(Filename)%(Extension)">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>

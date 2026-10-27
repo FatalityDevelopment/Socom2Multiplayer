@@ -18,14 +18,14 @@ public sealed class TicketStore
     private readonly DnasRepRepository _repository;
     private readonly ConcurrentDictionary<string, object> _gates = new(StringComparer.Ordinal);
 
-    public TicketStore(string root = "RSA", string? repositoryBaseUrl = null)
+    public TicketStore(string root = "RSA", string? repositoryBaseUrl = null, string? preferredRegion = null)
     {
         if (!Path.IsPathRooted(root) && !Directory.Exists(root) && Directory.Exists(Path.Combine(AppContext.BaseDirectory, root)))
             root = Path.Combine(AppContext.BaseDirectory, root);
 
         _root = Path.GetFullPath(root);
         RsaModulusAssets.CopyMissing(_root);
-        _repository = new DnasRepRepository(repositoryBaseUrl);
+        _repository = new DnasRepRepository(repositoryBaseUrl, preferredRegion);
     }
 
     /// <summary>

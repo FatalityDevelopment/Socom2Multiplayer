@@ -36,7 +36,7 @@ IIS or another web server may hold 80 or 443.
 | Path | Contents |
 |---|---|
 | `server-data.json`, `bans.json`, `cheat-scan.json` | Accounts, stats, friends, clans, bans |
-| `dnas/RSA/Signatures/<SERIAL>.BIN` | DNAS tickets (SOCOM II's is installed on first start; other titles are fetched from DNASrep and cached) |
+| `dnas/RSA/Signatures/<SERIAL>.BIN` | DNAS tickets, cached the first time a title logs in |
 | `dnas/PacketLogs/` | DnaSDK's per-session DNAS request/response captures |
 | `patch/APACHE00.ZDB` | The patch file to serve. Copy it in yourself; it is not in this repo |
 
@@ -63,10 +63,15 @@ DNAS settings (all optional):
 | Setting | Default |
 |---|---|
 | `DnasHttpsPort` | `443` (`0` disables DNAS) |
-| `DnasCertPath` / `DnasKeyPath` / `DnasCaPath` | The `gate1.us.dnas.playstation.org` chain bundled with DnaSDK |
+| `DnasRegion` | `us-gw`. Picks the certificate (`us-gw` → `cert-us`, `eu-gw` → `cert-eu`, `gai-gw` → `cert-jp`) and the packet region searched first |
+| `DnasCertPath` / `DnasKeyPath` | `Certificates/dnas.crt` + `dnas.key` if present, otherwise the `DnasRegion` certificate |
+| `DnasCaPath` | `Certificates/ca-cert.pem` |
 | `DnasRsaDirectory` | `<DataDirectory>/dnas/RSA` |
 | `DnasCaptureDirectory` | `<DataDirectory>/dnas/PacketLogs` |
-| `DnasRepositoryUrl` | DNASrep (`https://raw.githubusercontent.com/FogNo23/DNASrep/master/www/dnas`) |
+| `DnasRepositoryUrl` | `Data`. The captured packets (`<region>/packets/<lookup>_<operation>`) each title's original RSA ticket is taken from. Can also be an HTTPS DNASrep mirror |
+
+DnaSDK doesn't replay these packets. It runs a live exchange for every session. From a title's captured S1
+it takes only the original 128-byte signed ticket, which the retail client checks.
 
 ## Cloud deployment
 
@@ -77,7 +82,8 @@ See [deploy/azure/README.md](deploy/azure/README.md). It covers Azure Container 
 ```
 CodeDesigner.Ps2.Multiplayer/   Medius/DME/NAT/DNS/patch server (.NET 10)
   Servers/DnasServer.cs         Hosts DnaSDK's TLS/DNAS listener in-process
-  Dnas/Signatures/              Bundled original DNAS tickets (SCUS97275)
+  Certificates/                 DNAS gateway TLS certificates (per region) + CA
+  Data/<region>/packets/        Captured DNAS packets: the source of each title's RSA ticket
 DnaSDK/                         DnaSDK source (FatalityDevelopment/DnaSDK), used as a project reference
 deploy/azure/                   ACI bicep + deploy script
 Dockerfile, docker-compose.yml
@@ -85,10 +91,14 @@ Dockerfile, docker-compose.yml
 
 ### Updating DnaSDK
 
-`DnaSDK/` is a copy of the `DnaSDK/` folder from the upstream repo. The only local change is an
-`InternalsVisibleTo` in `DnaSDK.csproj`, which lets the server start its `TcpServer`. To update, copy the
-upstream folder over this one and keep that `ItemGroup`. Don't copy upstream's `Dockerfile`; the root
-`Dockerfile` builds both projects.
+`DnaSDK/` is a copy of the `DnaSDK/` folder from the upstream repo, with these local changes:
+
+- `DnaSDK.csproj` adds an `InternalsVisibleTo`, which lets the server start its `TcpServer`.
+- `DNAS.Server/DnasRepRepository.cs` reads a local packet folder as well as HTTPS, and searches a preferred region
+  first (`DnasServerConfiguration.PreferredRegion`, passed through `TicketStore`).
+
+To update, copy the upstream folder over this one and keep those changes. Don't copy upstream's `Dockerfile`;
+the root `Dockerfile` builds both projects.
 
 ## Building without Docker
 

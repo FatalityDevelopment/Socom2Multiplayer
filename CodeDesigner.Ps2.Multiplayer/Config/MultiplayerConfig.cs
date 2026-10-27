@@ -75,20 +75,26 @@ public class MultiplayerConfig
     public bool DnsForwardUnknown { get; set; } = true;
 
     /// <summary>
-    /// TLS certificate (PEM) for the DNAS HTTPS gateway. Empty = Certificates/cert-us.pem next to the binary
-    /// (the community gate1.us.dnas.playstation.org chain bundled with DnaSDK).
+    /// DNAS region: picks the community TLS certificate (us-gw → cert-us, eu-gw → cert-eu, gai-gw → cert-jp) and is
+    /// the packet region searched first for a title's ticket. Valid values: us-gw, eu-gw, gai-gw.
+    /// </summary>
+    public string DnasRegion { get; set; } = "us-gw";
+
+    /// <summary>
+    /// TLS certificate (PEM) for the DNAS HTTPS gateway. If empty, Certificates/dnas.crt is used when present,
+    /// otherwise the region certificate Certificates/cert-us|cert-eu|cert-jp.pem (see <see cref="DnasRegion"/>).
     /// </summary>
     public string DnasCertPath { get; set; } = "";
 
-    /// <summary>RSA private key (PEM) matching <see cref="DnasCertPath"/>. Empty = Certificates/cert-us-key.pem.</summary>
+    /// <summary>RSA private key (PEM) matching the certificate. If empty, Certificates/dnas.key or the region's -key.pem.</summary>
     public string DnasKeyPath { get; set; } = "";
 
     /// <summary>Issuer certificate (PEM) sent with the gateway certificate. Empty = Certificates/ca-cert.pem.</summary>
     public string DnasCaPath { get; set; } = "";
 
     /// <summary>
-    /// DnaSDK ticket root (Signatures/, Moduli/, Decoded/). Must be writable: tickets fetched from DNASrep are
-    /// cached here. Empty = &lt;DataDirectory&gt;/dnas/RSA. Bundled tickets (Dnas/Signatures) are copied in on start.
+    /// DnaSDK ticket cache (Signatures/, Moduli/, Decoded/). Must be writable: each title's ticket is taken from its
+    /// captured S1 packet once and cached here. Empty = &lt;DataDirectory&gt;/dnas/RSA.
     /// </summary>
     public string DnasRsaDirectory { get; set; } = "";
 
@@ -97,7 +103,11 @@ public class MultiplayerConfig
     /// </summary>
     public string DnasCaptureDirectory { get; set; } = "";
 
-    /// <summary>DNASrep archive root used to fetch tickets for titles without one on disk. Empty = DnaSDK default.</summary>
+    /// <summary>
+    /// Captured DNAS packets DnaSDK takes each title's original RSA ticket from: a local directory laid out as
+    /// &lt;region&gt;/packets/&lt;lookup&gt;_&lt;operation&gt; (relative paths resolve next to the binary), or an HTTPS DNASrep
+    /// mirror. Empty = Data (the packet files shipped with this server).
+    /// </summary>
     public string DnasRepositoryUrl { get; set; } = "";
 
     // ── NAT ───────────────────────────────────────────────────────────────────
