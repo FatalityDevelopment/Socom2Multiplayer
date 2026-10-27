@@ -1,4 +1,4 @@
-# SOCOM II online server — MUIS / MAS / MLS / DME / NAT / DNS / patch HTTP + DnaSDK DNAS, one container.
+# SOCOM II online server — MUIS / MAS / MLS / DME / NAT / DNAS / DNS / patch HTTP, one container.
 #   docker compose up --build              (local / LAN, see docker-compose.yml)
 #   docker build -t socom2-server .
 #   az acr build -r <registry> -t socom2-server:<tag> .
@@ -6,7 +6,6 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 COPY CodeDesigner.Ps2.Multiplayer/CodeDesigner.Ps2.Multiplayer.csproj CodeDesigner.Ps2.Multiplayer/
-COPY DnaSDK/DnaSDK.csproj DnaSDK/
 RUN dotnet restore CodeDesigner.Ps2.Multiplayer/CodeDesigner.Ps2.Multiplayer.csproj
 COPY . .
 RUN dotnet publish CodeDesigner.Ps2.Multiplayer/CodeDesigner.Ps2.Multiplayer.csproj \
