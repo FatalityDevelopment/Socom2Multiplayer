@@ -1,16 +1,14 @@
 using System.Net;
 using System.Net.Sockets;
 using CodeDesigner.Ps2.Multiplayer.Config;
-using DNAS;
+using CodeDesigner.Ps2.Multiplayer.Dnas;
 using Microsoft.Extensions.Logging;
-using TCP.Server;
-using TLS;
 
 namespace CodeDesigner.Ps2.Multiplayer.Servers;
 
 /// <summary>
-/// DNAS — Dynamic Network Authentication System gateway, served by DnaSDK
-/// (https://github.com/FatalityDevelopment/DnaSDK) running in this process.
+/// DNAS — Dynamic Network Authentication System gateway. The protocol, TLS and crypto code lives in Dnas/
+/// (namespace CodeDesigner.Ps2.Multiplayer.Dnas), taken from DnaSDK (https://github.com/FatalityDevelopment/DnaSDK).
 ///
 /// The PS2 contacts gate1.*.dnas.playstation.org:443 (DnsServer points it here). DnaSDK negotiates the
 /// console's legacy SSLv2-hello / TLS 1.0 / 3DES connection and runs the live six-message DNAS exchange:

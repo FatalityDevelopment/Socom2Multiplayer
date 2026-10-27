@@ -6,7 +6,7 @@ A private online server for SOCOM U.S. Navy SEALs II (PS2) in a single container
 |---|---|---|
 | DNS | 53/udp | The PS2's primary DNS. Answers `*.dnas.playstation.org` and `*.pdonline.scea.com` with this server's IP |
 | Patch HTTP | 80/tcp | Serves `APACHE00.ZDB` (r0004 patch) to unpatched consoles |
-| DNAS | 443/tcp | [DnaSDK](https://github.com/FatalityDevelopment/DnaSDK): live DNAS authentication for unmodified retail discs |
+| DNAS | 443/tcp | Live DNAS authentication for unmodified retail discs (code in `Dnas/`, from [DnaSDK](https://github.com/FatalityDevelopment/DnaSDK)) |
 | NAT | 10069/udp | NAT helper |
 | DME | 10070/tcp | Game worlds |
 | MUIS | 10071/tcp | Universe list, news, patch announcement |
@@ -35,7 +35,7 @@ hostname:
 SERVER_IP=192.168.1.20 EXTERNAL_DNAS=dnas.example.org docker compose up --build -d
 ```
 
-The built-in DnaSDK gateway then stays off. DNS answers `*.dnas.playstation.org` with the external server's
+The built-in DNAS gateway then stays off. DNS answers `*.dnas.playstation.org` with the external server's
 address (a hostname is re-resolved every minute). Medius names still point at `SERVER_IP`, so consoles
 authenticate with the external DNAS server and play on this one. Outside compose, the setting is
 `Online__ExternalDnasServer`; on Azure it's `-ExternalDnasServer`.
@@ -85,7 +85,7 @@ DNAS settings (all optional):
 | `DnasCaptureDirectory` | `<DataDirectory>/dnas/PacketLogs` |
 | `DnasRepositoryUrl` | `Data`. The captured packets (`<region>/packets/<lookup>_<operation>`) each title's original RSA ticket is taken from. Can also be an HTTPS DNASrep mirror |
 
-DnaSDK doesn't replay these packets. It runs a live exchange for every session. From a title's captured S1
+The DNAS code doesn't replay these packets. It runs a live exchange for every session. From a title's captured S1
 it takes only the original 128-byte signed ticket, which the retail client checks.
 
 ## Cloud deployment
@@ -96,24 +96,36 @@ See [deploy/azure/README.md](deploy/azure/README.md). It covers Azure Container 
 
 ```
 CodeDesigner.Ps2.Multiplayer/   Medius/DME/NAT/DNS/patch server (.NET 10)
-  Servers/DnasServer.cs         Hosts DnaSDK's TLS/DNAS listener in-process
+  Servers/DnasServer.cs         Starts the DNAS gateway
+  Dnas/                         DNAS protocol, TLS and crypto (from DnaSDK); README.md documents the protocol
   Certificates/                 DNAS gateway TLS certificates (per region) + CA
   Data/<region>/packets/        Captured DNAS packets: the source of each title's RSA ticket
-DnaSDK/                         DnaSDK source (FatalityDevelopment/DnaSDK), used as a project reference
 deploy/azure/                   ACI bicep + deploy script
 Dockerfile, docker-compose.yml
 ```
 
-### Updating DnaSDK
+### Updating from DnaSDK
 
-`DnaSDK/` is a copy of the `DnaSDK/` folder from the upstream repo, with these local changes:
+DnaSDK's source is part of the server project, not a separate project. It lives in `Dnas/` under one namespace,
+`CodeDesigner.Ps2.Multiplayer.Dnas`:
 
-- `DnaSDK.csproj` adds an `InternalsVisibleTo`, which lets the server start its `TcpServer`.
-- `DNAS.Server/DnasRepRepository.cs` reads a local packet folder as well as HTTPS, and searches a preferred region
-  first (`DnasServerConfiguration.PreferredRegion`, passed through `TicketStore`).
+| `Dnas/` folder | Upstream DnaSDK folder |
+|---|---|
+| `Client/` | `DNAS.Client/` |
+| `Cryptography/` | `DNAS.Cryptography/` |
+| `Server/` | `DNAS.Server/` |
+| `Transport/` | `TCP.Server/` |
+| `Tls/` | `TCP.TLS/` |
+| `Moduli/` | `Assets/Moduli/` |
 
-To update, copy the upstream folder over this one and keep those changes. Don't copy upstream's `Dockerfile`;
-the root `Dockerfile` builds both projects.
+To bring in a newer DnaSDK, copy its files into the matching folders and keep these differences:
+
+- Namespaces `DNAS`, `TCP.Server` and `TLS` all become `CodeDesigner.Ps2.Multiplayer.Dnas`. The `using DNAS;`,
+  `using TCP.Server;` and `using TLS;` lines are dropped. In `Client/ClientSetup.cs`, `DNAS.Identity` becomes
+  `global::CodeDesigner.Ps2.Multiplayer.Dnas.Identity`.
+- Upstream's `Program.cs` and `TCP.Server/ServerOptions.cs` (its standalone command-line tool), `Dockerfile`,
+  and `TCP.TLS/Certificates/` aren't copied. Certificates come from `Certificates/`.
+- `Server/DnasRepRepository.cs` reads a local packet folder as well as HTTPS, and searches a preferred region first.
 
 ## Building without Docker
 

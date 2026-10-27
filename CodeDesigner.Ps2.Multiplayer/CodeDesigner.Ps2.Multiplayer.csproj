@@ -15,11 +15,6 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.1" />
   </ItemGroup>
 
-  <!-- DNAS gateway (https://github.com/FatalityDevelopment/DnaSDK), hosted in-process by Servers/DnasServer.cs. -->
-  <ItemGroup>
-    <ProjectReference Include="..\DnaSDK\DnaSDK.csproj" />
-  </ItemGroup>
-
   <ItemGroup>
     <Content Include="config.json">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
@@ -32,8 +27,8 @@
     <Content Include="Certificates\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <!-- DnaSDK's optional RSA moduli (diagnostic ticket decode in <DnasRsaDirectory>/Decoded). -->
-    <Content Include="..\DnaSDK\Assets\Moduli\*.BIN" Link="Assets\Moduli\%(Filename)%(Extension)">
+    <!-- DNAS RSA moduli (optional diagnostic ticket decode); Dnas/ looks for them in Assets/Moduli next to the binary. -->
+    <Content Include="Dnas\Moduli\*.BIN" Link="Assets\Moduli\%(Filename)%(Extension)">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
