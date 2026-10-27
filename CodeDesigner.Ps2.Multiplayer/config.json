@@ -8,6 +8,7 @@
     "DmePort": 10070,
     "NatPort": 10069,
     "DnasHttpsPort": 443,
+    "ExternalDnasServer": "",
     "DnsDnasPort": 53,
     "DnasRegion": "us-gw",
     "DnasCertPath": "",

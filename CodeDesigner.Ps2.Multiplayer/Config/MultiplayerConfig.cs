@@ -59,6 +59,17 @@ public class MultiplayerConfig
     public int DnasHttpsPort { get; set; } = 443;
 
     /// <summary>
+    /// Use someone else's DNAS server instead of the built-in one: an IP address or hostname. When set, the built-in
+    /// DnaSDK gateway does not start and the DNS responder answers *.dnas.playstation.org with this server's address
+    /// (a hostname is re-resolved every minute), while Medius names (*.pdonline.scea.com) still point at ServerIp.
+    /// Empty = run DNAS here (default).
+    /// </summary>
+    public string ExternalDnasServer { get; set; } = "";
+
+    /// <summary>True when DNAS is handled by <see cref="ExternalDnasServer"/> rather than this process.</summary>
+    public bool UsesExternalDnas => !string.IsNullOrWhiteSpace(ExternalDnasServer);
+
+    /// <summary>
     /// DNAS DNS responder port (normally 53). The DNS server intercepts
     /// *.dnas.playstation.org queries and returns ServerIp.
     /// Requires elevated privileges on Linux (run as root or redirect port 53).

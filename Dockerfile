@@ -19,6 +19,7 @@ COPY --from=build /app .
 # Container defaults — override any setting with Online__<Name> environment variables.
 #   Online__ServerIp=auto + Online__PublicHostname=<fqdn>  → announce the IP the FQDN resolves to
 #   Online__DnsForwardUnknown=false                        → never act as an open DNS resolver
+#   Online__ExternalDnasServer=<ip|host>                   → use that DNAS server; the built-in one stays off
 #   Online__DataDirectory=/data                            → accounts, stats, clans, DNAS tickets + captures,
 #                                                            patch/APACHE00.ZDB (mount a volume)
 #   MULTIPLAYER_LOG_FILE=none                              → log to stdout only

@@ -28,6 +28,9 @@ param memoryInGb int = 2
 @allowed([ 'Debug', 'Information', 'Warning' ])
 param logLevel string = 'Debug'
 
+@description('Optional external DNAS server (IP or hostname). Empty = DNAS runs in this container.')
+param externalDnasServer string = ''
+
 resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
   name: acrName
 }
@@ -101,6 +104,7 @@ resource containerGroup 'Microsoft.ContainerInstance/containerGroups@2023-05-01'
             { name: 'MULTIPLAYER_LOG_FILE', value: 'none' }
             { name: 'Logging__LogLevel__Default', value: logLevel }
             { name: 'Online__DataDirectory', value: '/data' }
+            { name: 'Online__ExternalDnasServer', value: externalDnasServer }
           ]
           volumeMounts: [
             { name: 'data', mountPath: '/data' }

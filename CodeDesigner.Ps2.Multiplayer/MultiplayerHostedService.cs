@@ -50,7 +50,10 @@ public class MultiplayerHostedService : IHostedService
         _log.LogInformation("  MLS Port    : {Port}", _config.MlsPort);
         _log.LogInformation("  DME Port    : {Port}", _config.DmePort);
         _log.LogInformation("  NAT Port    : {Port} (UDP)", _config.NatPort);
-        _log.LogInformation("  DNAS HTTPS  : {Port} (DnaSDK, region={Region})", _config.DnasHttpsPort, _config.DnasRegion);
+        if (_config.UsesExternalDnas)
+            _log.LogInformation("  DNAS        : external {Server} (built-in gateway off)", _config.ExternalDnasServer);
+        else
+            _log.LogInformation("  DNAS HTTPS  : {Port} (DnaSDK, region={Region})", _config.DnasHttpsPort, _config.DnasRegion);
         _log.LogInformation("  DNS Port    : {Port} (UDP, intercepts *.dnas.playstation.org)", _config.DnsDnasPort);
         _log.LogInformation("  Patch HTTP  : {Port} ({Ver})", _config.PatchHttpPort, _config.UniversePatchVersion);
         _log.LogInformation("  AppIds      : {Ids}",  string.Join(", ", _config.AllowedAppIds));

@@ -11,6 +11,10 @@
 
 .EXAMPLE
   ./deploy/azure/deploy-aci.ps1 -AcrName socom2acr123 -DnsNameLabel socom2-test
+
+.EXAMPLE
+  # Use a friend's public DNAS server instead of the built-in one
+  ./deploy/azure/deploy-aci.ps1 -AcrName socom2acr123 -DnsNameLabel socom2-test -ExternalDnasServer dnas.example.org
 #>
 param(
     [Parameter(Mandatory)] [string] $AcrName,        # globally unique, lowercase letters/digits
@@ -18,7 +22,8 @@ param(
     [string] $ResourceGroup = 'socom2-test-rg',
     [string] $Location      = 'eastus',
     [string] $ImageTag      = $(git rev-parse --short HEAD),
-    [ValidateSet('Debug', 'Information', 'Warning')] [string] $LogLevel = 'Debug'
+    [ValidateSet('Debug', 'Information', 'Warning')] [string] $LogLevel = 'Debug',
+    [string] $ExternalDnasServer = ''                # IP/hostname of another DNAS server; empty = built-in DnaSDK
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +52,7 @@ Write-Host "==> Deploying container group"
 $out = Invoke-Az deployment group create --resource-group $ResourceGroup `
     --template-file (Join-Path $PSScriptRoot 'main.bicep') `
     --parameters acrName=$AcrName dnsNameLabel=$DnsNameLabel imageTag=$ImageTag logLevel=$LogLevel `
+        externalDnasServer=$ExternalDnasServer `
     --query properties.outputs --output json | ConvertFrom-Json
 
 Write-Host ""

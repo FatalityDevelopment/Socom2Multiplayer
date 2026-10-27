@@ -36,6 +36,12 @@ public class DnasServer
 
     public Task StartAsync(CancellationToken ct)
     {
+        if (_config.UsesExternalDnas)
+        {
+            _log.LogInformation("[DNAS] Built-in gateway off — consoles are sent to the external DNAS server {Server}",
+                _config.ExternalDnasServer);
+            return Task.CompletedTask;
+        }
         if (_config.DnasHttpsPort <= 0)
         {
             _log.LogInformation("[DNAS] Disabled (DnasHttpsPort=0)");

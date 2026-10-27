@@ -10,7 +10,9 @@ namespace CodeDesigner.Ps2.Multiplayer.Servers;
 ///
 /// The PS2 DNAS client resolves gate1.*.dnas.playstation.org before opening
 /// its HTTPS connection.  This server listens on UDP port 53 and:
-///   • Answers any A-record query for *.dnas.playstation.org with ServerIp.
+///   • Answers any A-record query for *.dnas.playstation.org with ServerIp, or with the address of
+///     ExternalDnasServer when DNAS is hosted elsewhere.
+///   • Answers *.pdonline.scea.com (Medius) with ServerIp.
 ///   • Forwards all other queries to the system resolver and relays the reply.
 ///
 /// Wire format (RFC 1035):
@@ -29,6 +31,11 @@ public class DnsServer
 
     // Well-known upstream resolver to forward non-DNAS queries.
     private static readonly IPEndPoint Upstream = new(IPAddress.Parse("8.8.8.8"), 53);
+
+    // ExternalDnasServer may be a hostname whose address changes; re-resolve it at most once a minute.
+    private static readonly TimeSpan ExternalDnasTtl = TimeSpan.FromMinutes(1);
+    private string?  _externalDnasIp;
+    private DateTime _externalDnasResolvedAt;
 
     public DnsServer(MultiplayerConfig config, ILogger<DnsServer> log)
     {
@@ -55,8 +62,12 @@ public class DnsServer
             return Task.CompletedTask;
         }
 
-        _log.LogInformation("[DNS] Listening on {Addr}:{Port} (UDP) — intercepting *.dnas.playstation.org + *.pdonline.scea.com → {Ip}",
-            _config.BindAddress, _config.DnsDnasPort, _config.ServerIp);
+        if (_config.UsesExternalDnas)
+            _log.LogInformation("[DNS] Listening on {Addr}:{Port} (UDP) — *.dnas.playstation.org → external DNAS {Dnas}, *.pdonline.scea.com → {Ip}",
+                _config.BindAddress, _config.DnsDnasPort, _config.ExternalDnasServer, _config.ServerIp);
+        else
+            _log.LogInformation("[DNS] Listening on {Addr}:{Port} (UDP) — intercepting *.dnas.playstation.org + *.pdonline.scea.com → {Ip}",
+                _config.BindAddress, _config.DnsDnasPort, _config.ServerIp);
 
         _ = ReceiveLoopAsync(ct);
         return Task.CompletedTask;
@@ -116,8 +127,9 @@ public class DnsServer
             ushort qtype  = (ushort)((buf[afterQname]     << 8) | buf[afterQname + 1]);
             // ushort qclass = (ushort)((buf[afterQname + 2] << 8) | buf[afterQname + 3]); // unused
 
-            bool isIntercept = qname.EndsWith(".dnas.playstation.org", StringComparison.OrdinalIgnoreCase)
-                            || qname.Equals("dnas.playstation.org",    StringComparison.OrdinalIgnoreCase)
+            bool isDnas      = qname.EndsWith(".dnas.playstation.org", StringComparison.OrdinalIgnoreCase)
+                            || qname.Equals("dnas.playstation.org",    StringComparison.OrdinalIgnoreCase);
+            bool isIntercept = isDnas
                             || qname.EndsWith(".pdonline.scea.com",    StringComparison.OrdinalIgnoreCase)
                             || qname.Equals("pdonline.scea.com",       StringComparison.OrdinalIgnoreCase);
 
@@ -140,7 +152,21 @@ public class DnsServer
                 client, qname, qtype, isIntercept, customIp ?? "-");
 
             byte[] reply;
-            if (isIntercept && qtype == 1 /* A */)
+            if (isDnas && qtype == 1 /* A */ && _config.UsesExternalDnas)
+            {
+                var dnasIp = await ResolveExternalDnasAsync(ct);
+                if (dnasIp != null)
+                {
+                    reply = BuildAResponse(buf, qname, dnasIp);
+                    _log.LogInformation("[DNS] {Name} → {Ip} (external DNAS {Server})", qname, dnasIp, _config.ExternalDnasServer);
+                }
+                else
+                {
+                    reply = BuildRefused(buf, afterQname + 4);
+                    _log.LogWarning("[DNS] {Name}: external DNAS {Server} did not resolve — refused", qname, _config.ExternalDnasServer);
+                }
+            }
+            else if (isIntercept && qtype == 1 /* A */)
             {
                 reply = BuildAResponse(buf, qname, _config.ServerIp);
                 _log.LogInformation("[DNS] {Name} → {Ip} (intercept)", qname, _config.ServerIp);
@@ -271,6 +297,38 @@ public class DnsServer
             ms.Write(bytes, 0, bytes.Length);
         }
         ms.WriteByte(0); // root label
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // External DNAS
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>IPv4 address of <see cref="MultiplayerConfig.ExternalDnasServer"/> (an IP, or a hostname resolved
+    /// through the system resolver and cached for a minute). Null if it doesn't resolve.</summary>
+    private async Task<string?> ResolveExternalDnasAsync(CancellationToken ct)
+    {
+        var server = _config.ExternalDnasServer.Trim();
+        if (IPAddress.TryParse(server, out var literal))
+            return literal.MapToIPv4().ToString();
+
+        if (_externalDnasIp != null && DateTime.UtcNow - _externalDnasResolvedAt < ExternalDnasTtl)
+            return _externalDnasIp;
+
+        try
+        {
+            var addresses = await Dns.GetHostAddressesAsync(server, AddressFamily.InterNetwork, ct);
+            if (addresses.Length > 0)
+            {
+                _externalDnasIp         = addresses[0].ToString();
+                _externalDnasResolvedAt = DateTime.UtcNow;
+            }
+        }
+        catch (Exception ex) when (ex is SocketException or ArgumentException)
+        {
+            _log.LogWarning("[DNS] Cannot resolve external DNAS {Server}: {Msg}", server, ex.Message);
+        }
+        // A stale address beats none if the lookup fails transiently.
+        return _externalDnasIp;
     }
 
     // ─────────────────────────────────────────────────────────────────────────

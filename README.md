@@ -26,6 +26,20 @@ Set `SERVER_IP` to the address the PS2 can reach, usually this machine's LAN IP.
 `SERVER_IP=...` in a `.env` file next to `docker-compose.yml`. On the PS2, set **Primary DNS** to that IP.
 DNS points the console at everything else.
 
+### Using someone else's DNAS server
+
+To send consoles to an external DNAS server, such as a friend's public one, set `EXTERNAL_DNAS` to its IP or
+hostname:
+
+```bash
+SERVER_IP=192.168.1.20 EXTERNAL_DNAS=dnas.example.org docker compose up --build -d
+```
+
+The built-in DnaSDK gateway then stays off. DNS answers `*.dnas.playstation.org` with the external server's
+address (a hostname is re-resolved every minute). Medius names still point at `SERVER_IP`, so consoles
+authenticate with the external DNAS server and play on this one. Outside compose, the setting is
+`Online__ExternalDnasServer`; on Azure it's `-ExternalDnasServer`.
+
 Logs: `docker compose logs -f`. Set `LOG_LEVEL=Debug` to log full packet hex.
 
 Ports 53, 80 and 443 must be free on the host. On Linux, `systemd-resolved` often holds 53. On Windows,
@@ -62,6 +76,7 @@ DNAS settings (all optional):
 
 | Setting | Default |
 |---|---|
+| `ExternalDnasServer` | Empty. Set an IP or hostname to use another DNAS server; the built-in one then stays off |
 | `DnasHttpsPort` | `443` (`0` disables DNAS) |
 | `DnasRegion` | `us-gw`. Picks the certificate (`us-gw` → `cert-us`, `eu-gw` → `cert-eu`, `gai-gw` → `cert-jp`) and the packet region searched first |
 | `DnasCertPath` / `DnasKeyPath` | `Certificates/dnas.crt` + `dnas.key` if present, otherwise the `DnasRegion` certificate |

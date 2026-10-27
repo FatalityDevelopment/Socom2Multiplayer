@@ -42,6 +42,7 @@ Settings come from `config.json` in the image, overridden by `Online__<Setting>`
 | `Online__DnsForwardUnknown` | `false` | Only DNAS/Medius names are answered; everything else is REFUSED, so the public DNS port isn't an open resolver. |
 | `MULTIPLAYER_LOG_FILE` | `none` | Logs go to stdout (`az container logs`), not an ever-growing file. |
 | `Logging__LogLevel__Default` | `Debug` | Full packet hex while testing; deploy with `-LogLevel Information` to quiet it. |
+| `Online__ExternalDnasServer` | empty | Set with `-ExternalDnasServer <ip-or-host>` to send consoles to another DNAS server. The built-in DnaSDK gateway then stays off, and DNS answers `*.dnas.playstation.org` with that server's address. |
 
 ## Test-deployment caveats
 
