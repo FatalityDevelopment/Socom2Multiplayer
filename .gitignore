@@ -1,0 +1,15 @@
+# Visual Studio / Rider
+.vs/
+.idea/
+*.suo
+*.user
+
+# Build outputs
+[Bb]in/
+[Oo]bj/
+
+# Runtime data (accounts, DNAS captures, logs) and local overrides
+data/
+PacketLogs/
+*.log
+.env

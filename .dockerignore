@@ -1,0 +1,12 @@
+**/bin/
+**/obj/
+**/.vs/
+**/*.user
+**/*.log
+**/data/
+**/PacketLogs/
+.git/
+.env
+Dockerfile
+docker-compose.yml
+deploy/

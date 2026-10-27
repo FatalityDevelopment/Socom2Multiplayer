@@ -1,0 +1,26 @@
+# Local / LAN server:  SERVER_IP=192.168.1.20 docker compose up --build
+# (or put SERVER_IP=... in a .env file next to this one). Point the PS2's primary DNS at SERVER_IP.
+services:
+  socom2-server:
+    build: .
+    image: socom2-server:local
+    restart: unless-stopped
+    environment:
+      Online__ServerIp: "${SERVER_IP:?set SERVER_IP to this machine's LAN IP, e.g. SERVER_IP=192.168.1.20}"
+      # On a LAN the console may need other names resolved too; forwarding is safe there.
+      Online__DnsForwardUnknown: "true"
+      Logging__LogLevel__Default: "${LOG_LEVEL:-Information}"
+    volumes:
+      - socom2-data:/data          # accounts, stats, clans, DNAS tickets + packet logs, patch/APACHE00.ZDB
+    ports:
+      - "53:53/udp"            # DNS — the PS2's primary DNS
+      - "80:80/tcp"            # patch download (APACHE00.ZDB)
+      - "443:443/tcp"          # DNAS (DnaSDK)
+      - "10069:10069/udp"      # NAT
+      - "10070:10070/tcp"      # DME
+      - "10071:10071/tcp"      # MUIS
+      - "10075:10075/tcp"      # MLS
+      - "10077:10077/tcp"      # MAS
+
+volumes:
+  socom2-data:

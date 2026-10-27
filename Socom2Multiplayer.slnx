@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="CodeDesigner.Ps2.Multiplayer/CodeDesigner.Ps2.Multiplayer.csproj" />
+  <Project Path="DnaSDK/DnaSDK.csproj" />
+</Solution>
