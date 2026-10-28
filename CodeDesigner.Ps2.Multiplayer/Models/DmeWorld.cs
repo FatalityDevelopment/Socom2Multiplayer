@@ -285,6 +285,8 @@ public class DmeWorld
     /// </summary>
     private static void Forward(DmeClientState target, int sourceDmeId, byte[] payload)
     {
+        // The 2-byte source prefix must still fit the frame's 16-bit length.
+        if (payload.Length + 2 > ScertPacket.MaxPayloadLength) return;
         var body = new byte[2 + payload.Length];
         body[0] = (byte)sourceDmeId;
         body[1] = (byte)(sourceDmeId >> 8);

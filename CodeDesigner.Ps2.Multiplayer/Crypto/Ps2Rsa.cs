@@ -79,11 +79,29 @@ public class Ps2Rsa
     /// </summary>
     public static byte[] GenerateMessageLessThan(BigInteger n)
     {
+        // A client controls N; a tiny one would make the rejection loop below spin forever.
+        if (n < MinClientModulus)
+            throw new ArgumentOutOfRangeException(nameof(n), "Client RSA modulus is too small.");
+
+        // Clear the bits above N's length so each draw is below N at least half the time.
+        int bits = (int)n.GetBitLength();
         var buf = new byte[64];
-        do { RandomNumberGenerator.Fill(buf); }
+        do
+        {
+            RandomNumberGenerator.Fill(buf);
+            for (int bit = bits; bit < 512; bit++)
+                buf[bit / 8] &= (byte)~(1 << (bit % 8));
+        }
         while (FromLE(buf) >= n);
         return buf;
     }
+
+    /// <summary>Smallest client modulus accepted: a real PS2 session key is a full 512-bit N.</summary>
+    private static readonly BigInteger MinClientModulus = BigInteger.One << 500;
+
+    /// <summary>True when <paramref name="ps2NBytes"/> (LE) is a 64-byte modulus large enough to key a session with.</summary>
+    public static bool IsUsableClientModulus(byte[] ps2NBytes)
+        => ps2NBytes.Length == 64 && FromLE(ps2NBytes) >= MinClientModulus;
 
     /// <summary>RSA encrypt: cipher = m^E mod N</summary>
     public byte[] Encrypt(byte[] input)

@@ -14,6 +14,9 @@ public class ScertPacket
     public const int HeaderSize        = 3;
     public const int EncryptedHashSize = 4;
 
+    /// <summary>Largest payload the 16-bit length field can carry.</summary>
+    public const int MaxPayloadLength  = 0xFFFF;
+
     public RT_MSG_TYPE MessageType { get; set; }
     public byte[]      Payload     { get; set; } = Array.Empty<byte>();
     public bool        IsEncrypted { get; set; }
@@ -249,6 +252,10 @@ public class ScertPacket
     /// </summary>
     public byte[] Serialize()
     {
+        // A longer payload would wrap the length field and desync the receiver's stream.
+        if (Payload.Length > MaxPayloadLength)
+            throw new InvalidOperationException($"{MessageType} payload of {Payload.Length} bytes exceeds the SCERT frame limit.");
+
         // Encrypted but empty: flag set, no hash (matches what the PS2 itself sends, e.g. "8F 00 00").
         if (Hash is { Length: EncryptedHashSize } && Payload.Length == 0)
             return [(byte)((byte)MessageType | 0x80), 0, 0];

@@ -55,18 +55,36 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
     public MediusAccount? GetAccountByName(string name) =>
         _accountsByName.TryGetValue(name, out var a) ? a : null;
 
-    public MediusAccount CreateAccount(string name, string passwordHash)
+    private readonly object _accountCreateLock = new();
+
+    /// <summary>
+    /// Create an account named <paramref name="name"/>, or return null when the name is taken. Checking and
+    /// creating happen under one lock, so two logins racing on a new name can't both create it.
+    /// </summary>
+    public MediusAccount? TryCreateAccount(string name, string passwordHash)
     {
-        var account = new MediusAccount
+        lock (_accountCreateLock)
         {
-            AccountId = Interlocked.Increment(ref _nextAccountId),
-            AccountName = name,
-            PasswordHash = passwordHash,
-        };
-        _accountsById[account.AccountId] = account;
-        _accountsByName[account.AccountName] = account;
-        MarkDirty();
-        return account;
+            if (_accountsByName.ContainsKey(name)) return null;
+            var account = new MediusAccount
+            {
+                AccountId = Interlocked.Increment(ref _nextAccountId),
+                AccountName = name,
+                PasswordHash = passwordHash,
+            };
+            _accountsById[account.AccountId] = account;
+            _accountsByName[account.AccountName] = account;
+            MarkDirty();
+            return account;
+        }
+    }
+
+    /// <summary>The account named <paramref name="name"/>, creating it (with <paramref name="passwordHash"/>) if missing.</summary>
+    public MediusAccount GetOrCreateAccount(string name, string passwordHash, out bool created)
+    {
+        var account = TryCreateAccount(name, passwordHash);
+        created = account != null;
+        return account ?? GetAccountByName(name)!;
     }
 
     // -------------------------------------------------------------------------
@@ -74,10 +92,29 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
     // -------------------------------------------------------------------------
     private readonly ConcurrentDictionary<string, int> _accountBySession = new(StringComparer.OrdinalIgnoreCase);
 
-    public void RegisterSession(string sessionKey, int accountId)
+    /// <summary>
+    /// Map <paramref name="sessionKey"/> to the account. A fresh login (<paramref name="replaceOthers"/>) also drops
+    /// the account's older keys, so keys from earlier sessions stop working and the table stays one key per login.
+    /// </summary>
+    public void RegisterSession(string sessionKey, int accountId, bool replaceOthers = false)
     {
-        if (!string.IsNullOrEmpty(sessionKey)) _accountBySession[sessionKey] = accountId;
+        if (string.IsNullOrEmpty(sessionKey)) return;
+        if (replaceOthers)
+            foreach (var (key, id) in _accountBySession)
+                if (id == accountId && !key.Equals(sessionKey, StringComparison.OrdinalIgnoreCase))
+                    _accountBySession.TryRemove(new KeyValuePair<string, int>(key, id));
+        _accountBySession[sessionKey] = accountId;
     }
+
+    /// <summary>Forget a session key (logout, or the connection that owned it closed).</summary>
+    public void RevokeSession(string? sessionKey)
+    {
+        if (!string.IsNullOrEmpty(sessionKey)) _accountBySession.TryRemove(sessionKey, out _);
+    }
+
+    /// <summary>True when <paramref name="sessionKey"/> is registered to <paramref name="accountId"/>.</summary>
+    public bool IsSessionOf(string? sessionKey, int accountId) =>
+        !string.IsNullOrEmpty(sessionKey) && _accountBySession.TryGetValue(sessionKey, out var id) && id == accountId;
 
     public MediusAccount? GetAccountBySession(string? sessionKey) =>
         !string.IsNullOrEmpty(sessionKey) && _accountBySession.TryGetValue(sessionKey, out var id) ? GetAccountById(id) : null;

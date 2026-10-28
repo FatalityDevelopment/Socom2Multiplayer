@@ -54,8 +54,19 @@ public class PatchHttpServer
             return Task.CompletedTask;
         }
 
-        _listener = new TcpListener(IPAddress.Parse(_config.BindAddress), _config.PatchHttpPort);
-        _listener.Start();
+        try
+        {
+            _listener = new TcpListener(IPAddress.Parse(_config.BindAddress), _config.PatchHttpPort);
+            _listener.Start();
+        }
+        catch (SocketException ex)
+        {
+            // Only unpatched consoles need this server; don't take the whole host down over it.
+            _log.LogError("[PATCH] Cannot bind {Addr}:{Port}: {Msg} — patch HTTP server disabled",
+                _config.BindAddress, _config.PatchHttpPort, ex.Message);
+            _listener = null;
+            return Task.CompletedTask;
+        }
         var file = new FileInfo(PatchPath);
         if (!string.IsNullOrWhiteSpace(_config.UniversePatchUrl) &&
             !_config.UniversePatchUrl.Trim().StartsWith("http://", StringComparison.OrdinalIgnoreCase))
@@ -77,23 +88,56 @@ public class PatchHttpServer
         try { _listener?.Stop(); } catch { /* ignore */ }
     }
 
+    /// <summary>Downloads in flight. A console needs one; the cap stops slow clients from tying up sockets.</summary>
+    private readonly SemaphoreSlim _connectionSlots = new(MaxConnections, MaxConnections);
+    private const int MaxConnections = 64;
+
     private async Task AcceptLoopAsync(CancellationToken ct)
     {
+        int failures = 0;
         while (!ct.IsCancellationRequested)
         {
             try
             {
                 var client = await _listener!.AcceptTcpClientAsync(ct);
-                _ = HandleClientAsync(client, ct);
+                failures = 0;
+                if (!_connectionSlots.Wait(0))
+                {
+                    _log.LogWarning("[PATCH] Refusing {Remote}: {Max} connections already open", SafeRemote(client), MaxConnections);
+                    client.Dispose();
+                    continue;
+                }
+                _ = ServeAsync(client, ct);
             }
             catch (OperationCanceledException) { break; }
             catch (ObjectDisposedException) { break; }
             catch (Exception ex)
             {
                 _log.LogWarning(ex, "[PATCH] Accept failed");
+                try { await Task.Delay(Math.Min(2000, 50 << Math.Min(failures++, 6)), ct); }
+                catch (OperationCanceledException) { break; }
             }
         }
     }
+
+    private async Task ServeAsync(TcpClient client, CancellationToken ct)
+    {
+        try { await HandleClientAsync(client, ct); }
+        finally { _connectionSlots.Release(); }
+    }
+
+    private static string SafeRemote(TcpClient client)
+    {
+        try { return client.Client.RemoteEndPoint?.ToString() ?? "?"; }
+        catch (ObjectDisposedException) { return "?"; }
+    }
+
+    /// <summary>Request text is attacker-controlled: replace control characters so it can't forge log lines.</summary>
+    private static string ForLog(string text)
+        => string.Create(text.Length, text, static (span, t) =>
+        {
+            for (int i = 0; i < t.Length; i++) span[i] = char.IsControl(t[i]) ? '?' : t[i];
+        });
 
     private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
     {
@@ -105,7 +149,10 @@ public class PatchHttpServer
             timeout.CancelAfter(TimeSpan.FromSeconds(120));
             var stream = client.GetStream();
 
-            var head = await ReadHeadAsync(stream, timeout.Token);
+            // Headers get a much shorter deadline than the download itself.
+            using var headTimeout = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+            headTimeout.CancelAfter(TimeSpan.FromSeconds(15));
+            var head = await ReadHeadAsync(stream, headTimeout.Token);
             if (head == null) return;
             var lines = head.Split("\r\n");
             var parts = lines[0].Split(' ');
@@ -122,7 +169,7 @@ public class PatchHttpServer
                 await WriteStatsAsync(stream, method, timeout.Token);
                 return;
             }
-            _log.LogInformation("[PATCH] {Remote} {Request} | {Headers}", remote, lines[0], string.Join(" | ", lines.Skip(1)));
+            _log.LogInformation("[PATCH] {Remote} {Request} | {Headers}", remote, ForLog(lines[0]), ForLog(string.Join(" | ", lines.Skip(1))));
 
             if ((method != "GET" && method != "HEAD") || !path.EndsWith("/" + PatchName, StringComparison.OrdinalIgnoreCase))
             {

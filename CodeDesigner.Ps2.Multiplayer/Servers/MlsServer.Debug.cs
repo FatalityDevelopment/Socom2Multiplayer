@@ -52,7 +52,7 @@ public partial class MlsServer
         for (int off = 0; off < length; off += MaxPeekChunk)
         {
             int n = Math.Min(MaxPeekChunk, length - off);
-            int seq = c.State.CheatSeq++;
+            int seq = c.State.NextCheatSeq();
             var waiter = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
             PendingPeeks[(connectionId, seq)] = waiter;
             try
@@ -163,7 +163,10 @@ public partial class MlsServer
               ?? (TryParseAddr(room, out uint id) ? rooms.FirstOrDefault(r => r.ChannelId == (int)id) : null);
         if (target == null) throw new ArgumentException($"no briefing room '{room}'; rooms: {string.Join(", ", rooms.Select(r => $"0x{r.ChannelId:X} {r.ChannelName}"))}");
 
-        var account = _store.GetAccountByName(name.Trim()) ?? _store.CreateAccount(name.Trim(), string.Empty);
+        var account = _store.GetOrCreateAccount(name.Trim(), string.Empty, out _);
+        // A password means a real player owns the name; a virtual player would hijack its presence.
+        if (account.PasswordHash.Length > 0)
+            throw new ArgumentException($"'{account.AccountName}' is a real player's account");
         if (_presence.IsOnline(account.AccountId) && !_presence.IsVirtual(account.AccountId))
             throw new ArgumentException($"'{account.AccountName}' is a real online player");
         _presence.AddVirtual(account.AccountId, target.ChannelId, target.ChannelName);

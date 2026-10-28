@@ -28,6 +28,11 @@ namespace CodeDesigner.Ps2.Multiplayer.Servers;
 /// GET /raw?world=W&amp;type=0x08&amp;hex=0100...         raw RT frame to every joined client
 /// GET /app?world=W&amp;from=K&amp;hex=...                  app payload relayed as if DME client K sent it
 ///
+/// Every request must carry an <c>X-Debug-Token</c> header (the value of <see cref="MultiplayerConfig.DebugApiToken"/>
+/// when one is set, otherwise any value) and a localhost Host header. A web page can't add a custom header to a
+/// cross-site request, so this stops a page open in the operator's browser from driving /poke or /raw.
+///   curl -H "X-Debug-Token: secret" "http://127.0.0.1:PORT/clients"
+///
 /// Notify layouts: v108 (default, what SOCOM II accepts) = [index:2][ip:16][key:64] / [index:2][ip:16];
 /// 4 = [index:2][scertId:2], 8 = 4 + [ip:4] — both rejected by the client (it drops out of the game).
 /// W is the DME world id (see /worlds); omit it when exactly one world has joined clients.
@@ -64,16 +69,23 @@ public class DebugApiServer
 
     private async Task AcceptLoopAsync(CancellationToken ct)
     {
+        int failures = 0;
         while (!ct.IsCancellationRequested)
         {
             try
             {
                 var client = await _listener!.AcceptTcpClientAsync(ct);
+                failures = 0;
                 _ = HandleClientAsync(client, ct);
             }
             catch (OperationCanceledException) { break; }
             catch (ObjectDisposedException) { break; }
-            catch (Exception ex) { _log.LogWarning(ex, "[DEBUG] Accept failed"); }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "[DEBUG] Accept failed");
+                try { await Task.Delay(Math.Min(2000, 50 << Math.Min(failures++, 6)), ct); }
+                catch (OperationCanceledException) { break; }
+            }
         }
     }
 
@@ -83,32 +95,85 @@ public class DebugApiServer
         try
         {
             var stream = client.GetStream();
-            var buf = new byte[4096];
-            int len = await stream.ReadAsync(buf, ct);
-            var requestLine = Encoding.ASCII.GetString(buf, 0, len).Split("\r\n")[0];
+            using var readTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            readTimeout.CancelAfter(TimeSpan.FromSeconds(5));
+            var head = await ReadHeadAsync(stream, readTimeout.Token);
+            var lines = head.Split("\r\n");
+            var requestLine = lines[0];
             var parts = requestLine.Split(' ');
             string body;
             int code = 200;
             try
             {
+                Authorize(lines);
                 body = parts.Length >= 2
                     ? await HandleMemoryAsync(parts[1], ct) ?? Handle(parts[1])
                     : throw new ArgumentException("bad request");
             }
-            catch (ArgumentException ex)
+            catch (UnauthorizedAccessException ex)
+            {
+                code = 403;
+                body = ex.Message;
+            }
+            catch (Exception ex) when (ex is ArgumentException or FormatException or OverflowException)
             {
                 code = 400;
                 body = ex.Message;
             }
             _log.LogInformation("[DEBUG] {Request} -> {Code} {Body}", requestLine, code, body.Replace('\n', ' '));
-            var msg = $"HTTP/1.1 {code} {(code == 200 ? "OK" : "Bad Request")}\r\nContent-Type: text/plain\r\n" +
+            var reason = code switch { 200 => "OK", 403 => "Forbidden", _ => "Bad Request" };
+            var msg = $"HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain\r\n" +
                       $"Content-Length: {Encoding.ASCII.GetByteCount(body)}\r\nConnection: close\r\n\r\n{body}";
             await stream.WriteAsync(Encoding.ASCII.GetBytes(msg), ct);
         }
         catch (Exception ex) when (ex is IOException or OperationCanceledException)
         {
-            // client went away
+            // client went away (or never finished its request)
         }
+    }
+
+    /// <summary>Read the request line and headers (up to the blank line, at most 8 KiB).</summary>
+    private static async Task<string> ReadHeadAsync(NetworkStream stream, CancellationToken ct)
+    {
+        var buf = new byte[8192];
+        int len = 0;
+        while (len < buf.Length)
+        {
+            int read = await stream.ReadAsync(buf.AsMemory(len), ct);
+            if (read == 0) break;
+            len += read;
+            int end = Encoding.ASCII.GetString(buf, 0, len).IndexOf("\r\n\r\n", StringComparison.Ordinal);
+            if (end >= 0) return Encoding.ASCII.GetString(buf, 0, end);
+        }
+        return Encoding.ASCII.GetString(buf, 0, len);
+    }
+
+    /// <summary>Require a localhost Host (defeats DNS rebinding) and the X-Debug-Token header (defeats cross-site requests).</summary>
+    private void Authorize(string[] requestLines)
+    {
+        string? host = null, token = null;
+        foreach (var line in requestLines.Skip(1))
+        {
+            int colon = line.IndexOf(':');
+            if (colon <= 0) continue;
+            var name  = line[..colon].Trim();
+            var value = line[(colon + 1)..].Trim();
+            if (name.Equals("Host", StringComparison.OrdinalIgnoreCase)) host = value;
+            else if (name.Equals("X-Debug-Token", StringComparison.OrdinalIgnoreCase)) token = value;
+        }
+
+        var hostName = host == null ? null
+            : host.StartsWith('[') ? host[..(host.IndexOf(']') + 1)]
+            : host.Split(':')[0];
+        if (hostName is not ("127.0.0.1" or "localhost" or "[::1]"))
+            throw new UnauthorizedAccessException("Host must be 127.0.0.1 or localhost");
+
+        if (token == null)
+            throw new UnauthorizedAccessException("missing X-Debug-Token header");
+        if (_config.DebugApiToken.Length > 0 &&
+            !System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                Encoding.UTF8.GetBytes(token), Encoding.UTF8.GetBytes(_config.DebugApiToken)))
+            throw new UnauthorizedAccessException("wrong X-Debug-Token");
     }
 
     /// <summary>

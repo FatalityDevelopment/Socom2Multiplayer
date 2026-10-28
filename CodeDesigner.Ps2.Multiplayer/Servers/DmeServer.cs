@@ -68,7 +68,7 @@ public class DmeServer : BaseMediusTcpServer
         if (world == null || slot == null)
         {
             _log.LogWarning("[DME] Connect for world {World} with unknown access key '{Key}' ({Worlds})",
-                state.WorldId, state.AccessKey, string.Join(", ", DmeWorld.All));
+                state.WorldId, state.AccessKey.Length > 4 ? state.AccessKey[..4] + "…" : state.AccessKey, string.Join(", ", DmeWorld.All));
             return Task.FromResult<(ushort, ushort)?>(null);
         }
 
@@ -77,8 +77,14 @@ public class DmeServer : BaseMediusTcpServer
         slot.ScertId       = state.ScertId;
         if (state.ClientCryptKey.Length > 0) slot.PublicKey = state.ClientCryptKey;
         if (tcp.Client.RemoteEndPoint is System.Net.IPEndPoint ep) slot.IpAddress = ep.Address.MapToIPv4().ToString();
-        slot.Sender        = (type, payload) =>
-            SendPacketAsync(tcp, new ScertPacket { MessageType = type, Payload = payload }, state, ct);
+        slot.Bind(
+            (type, payload) => SendPacketAsync(tcp, new ScertPacket { MessageType = type, Payload = payload }, state, ct),
+            () =>
+            {
+                _log.LogWarning("[DME] Player {Id} in {World} fell {N} frames behind — disconnecting",
+                    slot.DmeId, world, DmeClientState.OutboxCapacity);
+                try { tcp.Close(); } catch { /* already gone */ }
+            });
 
         state.DmeWorldId         = world.WorldId;
         state.DmeClientIndex     = slot.DmeId;
@@ -183,9 +189,13 @@ public class DmeServer : BaseMediusTcpServer
                 int count = payload[0];
                 int dataOffset = 1 + count * 2;
                 if (payload.Length < dataOffset) break;
-                var targets = new List<int>(count);
+                // Each target gets one copy: repeated ids (or the sender itself) would multiply the relay.
+                var targets = new HashSet<int>(count);
                 for (int i = 0; i < count; i++)
-                    targets.Add(payload[1 + i * 2] | (payload[2 + i * 2] << 8));
+                {
+                    int target = payload[1 + i * 2] | (payload[2 + i * 2] << 8);
+                    if (target != slot.DmeId) targets.Add(target);
+                }
                 world.SendAppList(slot, targets, payload[dataOffset..]);
                 break;
             }

@@ -49,6 +49,12 @@ public class MultiplayerConfig
     /// </summary>
     public int DebugApiPort { get; set; }
 
+    /// <summary>
+    /// Shared secret every debug API request must send as its X-Debug-Token header. Empty = the header is still
+    /// required (it blocks cross-site requests from a browser) but any value is accepted.
+    /// </summary>
+    public string DebugApiToken { get; set; } = "";
+
     // ── DNAS ─────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -83,7 +89,7 @@ public class MultiplayerConfig
     /// open resolver that gets abused for DNS amplification, so internet deployments set this false and
     /// unknown names are REFUSED.
     /// </summary>
-    public bool DnsForwardUnknown { get; set; } = true;
+    public bool DnsForwardUnknown { get; set; } = false;
 
     /// <summary>
     /// DNAS region: picks the community TLS certificate (us-gw → cert-us, eu-gw → cert-eu, gai-gw → cert-jp) and is
@@ -128,7 +134,7 @@ public class MultiplayerConfig
 
     // ── Game ─────────────────────────────────────────────────────────────────
 
-    /// <summary>Maximum clients per server before new connections are rejected.</summary>
+    /// <summary>Maximum simultaneous connections per Medius/DME listener; further connections are closed on accept. 0 = no limit.</summary>
     public int MaxClients { get; set; } = 1000;
 
     /// <summary>
@@ -157,8 +163,23 @@ public class MultiplayerConfig
     /// <summary>When true, accounts are auto-created on first login (no separate registration).</summary>
     public bool AutoCreateAccounts { get; set; } = true;
 
-    /// <summary>Client idle timeout in seconds.</summary>
+    /// <summary>
+    /// Seconds a new connection has to finish the SCERT handshake before it is closed. Stops idle sockets that
+    /// never speak from holding a slot. 0 = no limit.
+    /// </summary>
     public int ClientTimeoutSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// Seconds an established connection may go without sending anything before it is closed. In-lobby and
+    /// in-game clients heartbeat on their own, so this only reaps dead or abandoned sessions. 0 = no limit.
+    /// </summary>
+    public int IdleTimeoutSeconds { get; set; } = 900;
+
+    /// <summary>
+    /// Most simultaneous TCP connections one IP address may hold on each Medius/DME listener (a console uses up to
+    /// two per listener). Consoles behind one NAT share an address, so keep headroom. 0 = no limit.
+    /// </summary>
+    public int MaxConnectionsPerIp { get; set; } = 32;
 
     // ── On-screen text / messages ────────────────────────────────────────────
     // Each of these maps to a DIFFERENT screen in the game's online flow. They are

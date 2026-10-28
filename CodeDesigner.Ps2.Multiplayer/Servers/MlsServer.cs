@@ -52,6 +52,12 @@ public partial class MlsServer : BaseMediusTcpServer
 
         var account = _store.GetAccountBySession(state.AccessKey);
         if (account == null) return null;
+        if (account.IsBanned || _admin.Bans.FindAccount(account.AccountName) != null)
+        {
+            _log.LogWarning("[MLS] Connection {Conn} presented a session of banned account '{Name}' — ignored",
+                state.ConnectionId, account.AccountName);
+            return null;
+        }
 
         state.AccountId   = account.AccountId;
         state.AccountName = account.AccountName;
@@ -436,8 +442,12 @@ public partial class MlsServer : BaseMediusTcpServer
 
     private async Task HandleSessionBeginAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
-        state.SessionKey = Guid.NewGuid().ToString("N")[..16].ToUpperInvariant();
+        state.SessionKey = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8));
         state.Status     = PlayerStatus.InChatWorld;
+        // Later requests on this connection may present this key (e.g. JoinChannel falls back to it), so it has to
+        // resolve to the same account as the connection's MAS key.
+        if (ResolveAccount(state) is { } account)
+            _store.RegisterSession(state.SessionKey, account.AccountId);
 
         var w = new MediusWriter();
         w.Write((int)MediusCallbackStatus.MediusSuccess);
@@ -449,6 +459,12 @@ public partial class MlsServer : BaseMediusTcpServer
     private async Task HandleAccountLogoutAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
         state.Status = PlayerStatus.Disconnected;
+        _store.RevokeSession(state.AccessKey);
+        _store.RevokeSession(state.SessionKey);
+        if (_presenceByConnection.TryRemove(state.ConnectionId, out int loggedOut))
+            _presence.Disconnected(loggedOut);
+        state.AccountId   = null;
+        state.AccountName = string.Empty;
         var w = new MediusWriter();
         w.Write((int)MediusCallbackStatus.MediusSuccess);
         await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.AccountLogoutResponse, w.ToArray()), ct);

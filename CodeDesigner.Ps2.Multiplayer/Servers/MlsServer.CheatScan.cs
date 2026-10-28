@@ -47,7 +47,7 @@ public partial class MlsServer
                 if (state.ScanCursor < start || state.ScanCursor >= end) state.ScanCursor = start;
 
                 int chunk = (int)Math.Min((uint)Math.Clamp(cfg.ChunkSize, 4, 1024), end - state.ScanCursor);
-                int seq = state.CheatSeq++;
+                int seq = state.NextCheatSeq();
                 await SendPacketAsync(tcp, ScertPacket.CreateRawMemoryQuery(seq, state.ScanCursor, chunk), state, ct);
 
                 state.ScanCursor += (uint)chunk;

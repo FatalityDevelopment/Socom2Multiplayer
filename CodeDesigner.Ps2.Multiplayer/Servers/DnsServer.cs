@@ -37,6 +37,9 @@ public class DnsServer
     private string?  _externalDnasIp;
     private DateTime _externalDnasResolvedAt;
 
+    // Each forwarded query holds a socket for up to 3 s; cap how many are in flight so a flood can't exhaust sockets.
+    private readonly SemaphoreSlim _forwardSlots = new(64, 64);
+
     public DnsServer(MultiplayerConfig config, ILogger<DnsServer> log)
     {
         _config = config;
@@ -50,9 +53,15 @@ public class DnsServer
     public Task StartAsync(CancellationToken ct)
     {
         _ct = ct;
+        if (_config.DnsDnasPort == 0)
+        {
+            _log.LogInformation("[DNS] Port = 0 — disabled, not listening");
+            return Task.CompletedTask;
+        }
         try
         {
             _udp = new UdpClient(new IPEndPoint(IPAddress.Parse(_config.BindAddress), _config.DnsDnasPort));
+            UdpSockets.IgnoreConnectionResets(_udp);
         }
         catch (SocketException ex)
         {
@@ -117,6 +126,17 @@ public class DnsServer
                 return;
             }
 
+            // Only standard queries with exactly one question. Answering a response (QR=1) would let two DNS
+            // servers be made to bounce packets between each other forever.
+            bool isResponse = (buf[2] & 0x80) != 0;
+            int  opcode     = (buf[2] >> 3) & 0x0F;
+            int  qdCount    = (buf[4] << 8) | buf[5];
+            if (isResponse || opcode != 0 || qdCount != 1)
+            {
+                _log.LogDebug("[DNS] Ignoring packet from {Ep} (QR={Qr} opcode={Op} QDCOUNT={Qd})", client, isResponse, opcode, qdCount);
+                return;
+            }
+
             string? qname = ParseQName(buf, 12, out int afterQname);
             if (qname == null || afterQname + 4 > buf.Length)
             {
@@ -178,8 +198,17 @@ public class DnsServer
             }
             else if (_config.DnsForwardUnknown)
             {
-                reply = await ForwardAsync(buf, ct);
-                _log.LogDebug("[DNS] Forwarded {Name}", qname);
+                if (!await _forwardSlots.WaitAsync(0, ct))
+                {
+                    reply = BuildRefused(buf, afterQname + 4);
+                    _log.LogDebug("[DNS] Refused {Name}: too many forwards in flight", qname);
+                }
+                else
+                {
+                    try { reply = await ForwardAsync(buf, ct); }
+                    finally { _forwardSlots.Release(); }
+                    _log.LogDebug("[DNS] Forwarded {Name}", qname);
+                }
             }
             else
             {
@@ -207,10 +236,11 @@ public class DnsServer
     /// immediately following the zero-length terminator.
     /// Returns null if the buffer is malformed.
     /// </summary>
-    private static string? ParseQName(byte[] buf, int offset, out int afterName)
+    internal static string? ParseQName(byte[] buf, int offset, out int afterName)
     {
         afterName = offset;
         var parts = new List<string>();
+        int nameLength = 0;
 
         while (offset < buf.Length)
         {
@@ -221,15 +251,19 @@ public class DnsServer
                 return string.Join('.', parts);
             }
 
-            // Pointer (compression) — not expected in queries but handle gracefully
-            if ((len & 0xC0) == 0xC0)
-            {
-                afterName = offset + 2;
-                return string.Join('.', parts); // incomplete but safe
-            }
+            // Labels are 1..63 bytes. The top two bits set means a compression pointer, which a query's
+            // question never needs; 0x40-0xBF are reserved. Reject them rather than guess.
+            if (len > 63) return null;
 
             offset++;
             if (offset + len > buf.Length) return null;
+            nameLength += len + 1;
+            if (nameLength > 255) return null;
+
+            // Hostname characters only: a '.' or control byte inside a label would change the name when it is
+            // re-encoded into the reply.
+            for (int i = offset; i < offset + len; i++)
+                if (buf[i] <= 0x20 || buf[i] >= 0x7F || buf[i] == (byte)'.') return null;
 
             parts.Add(System.Text.Encoding.ASCII.GetString(buf, offset, len));
             offset += len;

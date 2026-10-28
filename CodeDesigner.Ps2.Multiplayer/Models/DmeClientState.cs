@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using CodeDesigner.Ps2.Multiplayer.Protocol;
 
 namespace CodeDesigner.Ps2.Multiplayer.Models;
@@ -45,9 +46,18 @@ public class DmeClientState
 
     /// <summary>
     /// Sends one RT frame (type + plaintext payload) to this client over its encrypted DME connection.
-    /// Null until the client's TCP connection is bound to the slot.
+    /// Null until the client's TCP connection is bound to the slot (<see cref="Bind"/>).
     /// </summary>
-    public Func<RT_MSG_TYPE, byte[], Task>? Sender { get; set; }
+    public Func<RT_MSG_TYPE, byte[], Task>? Sender { get; private set; }
+
+    /// <summary>
+    /// Frames waiting to be written to this client. Relays from every other player land here, so a client that
+    /// stops reading can't make the server buffer without limit: when the queue fills, the connection is dropped.
+    /// </summary>
+    public const int OutboxCapacity = 1024;
+
+    private Channel<(RT_MSG_TYPE Type, byte[] Payload)>? _outbox;
+    private Action? _onOverflow;
 
     // ── State flags ───────────────────────────────────────────────────────────
 
@@ -91,11 +101,41 @@ public class DmeClientState
 
     // ── Outbound helpers ──────────────────────────────────────────────────────
 
-    /// <summary>Send one RT frame to this client (fire-and-forget; send errors surface in the server log).</summary>
+    /// <summary>
+    /// Bind the slot to a live connection: frames queued with <see cref="Send"/> are written through
+    /// <paramref name="sender"/> one at a time, in order. <paramref name="onOverflow"/> runs (once) when the client
+    /// falls <see cref="OutboxCapacity"/> frames behind.
+    /// </summary>
+    public void Bind(Func<RT_MSG_TYPE, byte[], Task> sender, Action onOverflow)
+    {
+        _outbox?.Writer.TryComplete();
+        var outbox = Channel.CreateBounded<(RT_MSG_TYPE, byte[])>(new BoundedChannelOptions(OutboxCapacity)
+        {
+            SingleReader = true,
+            FullMode     = BoundedChannelFullMode.Wait,   // TryWrite fails when full instead of dropping a frame
+        });
+        _outbox     = outbox;
+        _onOverflow = onOverflow;
+        Sender      = sender;
+        _ = PumpAsync(outbox.Reader, sender);
+    }
+
+    private static async Task PumpAsync(ChannelReader<(RT_MSG_TYPE Type, byte[] Payload)> reader, Func<RT_MSG_TYPE, byte[], Task> sender)
+    {
+        await foreach (var (type, payload) in reader.ReadAllAsync())
+        {
+            try { await sender(type, payload); }
+            catch { /* send errors are logged by the server; the connection's own loop tears it down */ }
+        }
+    }
+
+    /// <summary>Queue one RT frame for this client. Never blocks; send errors surface in the server log.</summary>
     public void Send(RT_MSG_TYPE type, byte[] payload)
     {
-        if (Disconnected || Sender == null) return;
-        _ = Sender(type, payload);
+        var outbox = _outbox;
+        if (Disconnected || outbox == null) return;
+        if (!outbox.Writer.TryWrite((type, payload)))
+            Interlocked.Exchange(ref _onOverflow, null)?.Invoke();
     }
 
     /// <summary>The client's 64-byte RSA public modulus (N_ps2, LE) from CLIENT_CRYPTKEY_PUBLIC; peers need it.</summary>
@@ -155,6 +195,7 @@ public class DmeClientState
     {
         Disconnected = true;
         Sender = null;
+        _outbox?.Writer.TryComplete();
     }
 
     public override string ToString()

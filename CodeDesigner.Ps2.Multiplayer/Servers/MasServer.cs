@@ -28,12 +28,12 @@ public class MasServer : BaseMediusTcpServer
     public MasServer(MultiplayerConfig config, InMemoryStorage store, AdminSettings admin, ILogger<MasServer> log)
         : base(log, config)
     {
-        _admin = admin;
-        admin.BansChanged += bans => KickBanned(bans, _store);
+        _admin     = admin;
         _config    = config;
         _store     = store;
         _log       = log;
         ServerName = "MAS";
+        admin.BansChanged += bans => KickBanned(bans, _store);
     }
 
     public Task StartAsync(CancellationToken ct) =>
@@ -97,8 +97,8 @@ public class MasServer : BaseMediusTcpServer
                     break;
 
                 default:
-                    _log.LogInformation("[MAS] Unhandled lobby msg 0x{Type:X2} payload={Hex}",
-                        packet.MessageType, BitConverter.ToString(packet.Payload).Replace("-", " "));
+                    _log.LogInformation("[MAS] Unhandled lobby msg 0x{Type:X2} ({Len} bytes)",
+                        packet.MessageType, packet.Payload.Length);
                     break;
             }
         }
@@ -119,15 +119,15 @@ public class MasServer : BaseMediusTcpServer
                     break;
 
                 default:
-                    _log.LogInformation("[MAS] Unhandled lobbyExt msg 0x{Type:X2} payload={Hex}",
-                        packet.MessageType, BitConverter.ToString(packet.Payload).Replace("-", " "));
+                    _log.LogInformation("[MAS] Unhandled lobbyExt msg 0x{Type:X2} ({Len} bytes)",
+                        packet.MessageType, packet.Payload.Length);
                     break;
             }
         }
         else
         {
-            _log.LogInformation("[MAS] Unknown msg class=0x{Class:X2} type=0x{Type:X2} payload={Hex}",
-                (byte)packet.MessageClass, packet.MessageType, BitConverter.ToString(packet.Payload).Replace("-", " "));
+            _log.LogInformation("[MAS] Unknown msg class=0x{Class:X2} type=0x{Type:X2} ({Len} bytes)",
+                (byte)packet.MessageClass, packet.MessageType, packet.Payload.Length);
         }
     }
 
@@ -146,8 +146,7 @@ public class MasServer : BaseMediusTcpServer
         state.SessionKey = GenerateSessionKey();
         state.Status     = PlayerStatus.InAuthWorld;
 
-        _log.LogInformation("[MAS] SessionBegin msgId={MsgId} -> key={Key}",
-            BitConverter.ToString(msgId).Replace("-", ""), state.SessionKey);
+        _log.LogInformation("[MAS] SessionBegin msgId={MsgId}", Convert.ToHexString(msgId));
 
         // SessionBeginResponse — wire format ported from horizon-server-public-extended
         // MediusSessionBeginResponse.Serialize():
@@ -184,7 +183,7 @@ public class MasServer : BaseMediusTcpServer
         state.SessionKey = GenerateSessionKey();
         state.Status     = PlayerStatus.InAuthWorld;
 
-        _log.LogInformation("[MAS] ExtendedSessionBegin -> key={Key}", state.SessionKey);
+        _log.LogInformation("[MAS] ExtendedSessionBegin");
 
         var w = new MediusWriter();
         w.Write(msgId);                                                       // messageId echo (21 bytes)
@@ -211,33 +210,47 @@ public class MasServer : BaseMediusTcpServer
         _log.LogInformation("[MAS] AccountLogin: user={User}", username);
 
         MediusCallbackStatus status;
-        MediusAccount? account = _store.GetAccountByName(username);
+        if (!IsValidAccountName(username))
+        {
+            await SendLoginFailure(tcp, MediusCallbackStatus.MediusAccountNotFound, msgId, ct);
+            return;
+        }
+        if (BanFor(username, tcp) is string banReason)
+        {
+            _log.LogWarning("[MAS] Login refused — '{User}' is banned ({Reason})", username, banReason);
+            await SendLoginFailure(tcp, MediusCallbackStatus.MediusAccountBanned, msgId, ct);
+            return;
+        }
 
+        MediusAccount? account = _store.GetAccountByName(username);
+        bool created = false;
         if (account == null)
         {
-            if (_config.AutoCreateAccounts)
-            {
-                account = _store.CreateAccount(username, HashPassword(password));
-                _log.LogInformation("[MAS] Auto-created account '{User}' id={Id}", username, account.AccountId);
-            }
-            else
+            if (!_config.AutoCreateAccounts)
             {
                 status = MediusCallbackStatus.MediusAccountNotFound;
                 await SendLoginFailure(tcp, status, msgId, ct);
                 return;
             }
-        }
-        else if (account.PasswordHash != HashPassword(password))
-        {
-            await SendLoginFailure(tcp, MediusCallbackStatus.MediusLoginFailed, msgId, ct);
-            return;
+            account = _store.GetOrCreateAccount(username, PasswordHasher.Hash(password), out created);
+            if (created)
+                _log.LogInformation("[MAS] Auto-created account '{User}' id={Id}", username, account.AccountId);
         }
 
-        var ban = _admin.Bans.FindAccount(account.AccountName)
-                  ?? _admin.Bans.FindIp((tcp.Client.RemoteEndPoint as System.Net.IPEndPoint)?.Address);
-        if (account.IsBanned || ban != null)
+        if (!created)
         {
-            _log.LogWarning("[MAS] Login refused — '{User}' is banned ({Reason})", username, ban?.Reason ?? "account flag");
+            if (!PasswordHasher.Verify(password, account.PasswordHash, out bool upgrade))
+            {
+                _log.LogInformation("[MAS] AccountLogin: wrong password for '{User}'", username);
+                await SendLoginFailure(tcp, MediusCallbackStatus.MediusLoginFailed, msgId, ct);
+                return;
+            }
+            if (upgrade) account.PasswordHash = PasswordHasher.Hash(password);
+        }
+
+        if (account.IsBanned)
+        {
+            _log.LogWarning("[MAS] Login refused — '{User}' is banned (account flag)", username);
             await SendLoginFailure(tcp, MediusCallbackStatus.MediusAccountBanned, msgId, ct);
             return;
         }
@@ -248,7 +261,7 @@ public class MasServer : BaseMediusTcpServer
         status            = MediusCallbackStatus.MediusSuccess;
 
         // The lobby (MLS) connections present this session key back — map it to the account there.
-        _store.RegisterSession(state.SessionKey, account.AccountId);
+        _store.RegisterSession(state.SessionKey, account.AccountId, replaceOthers: true);
         account.LastLoginAt = DateTime.UtcNow;
         _store.MarkDirty();
 
@@ -318,7 +331,15 @@ public class MasServer : BaseMediusTcpServer
 
         _log.LogInformation("[MAS] AnonymousLogin");
 
-        state.AccountId   = 0;
+        if (BanFor(null, tcp) is string banReason)
+        {
+            _log.LogWarning("[MAS] AnonymousLogin refused — address is banned ({Reason})", banReason);
+            await SendLoginFailure(tcp, MediusCallbackStatus.MediusAccountBanned, msgId, ct, MediusLobbyMessageId.AnonymousLoginResponse);
+            return;
+        }
+
+        // No account: leave AccountId unset so nothing treats this connection as a real player.
+        state.AccountId   = null;
         state.AccountName = "Anonymous";
         state.Status      = PlayerStatus.InAuthWorld;
 
@@ -366,7 +387,17 @@ public class MasServer : BaseMediusTcpServer
         // success-like value), then AccountID from where StatusCode would
         // be, then garbage, and bounces back to login mid-handshake.
 
-        if (_store.GetAccountByName(username) != null)
+        var regStatus = !IsValidAccountName(username) ? MediusCallbackStatus.MediusRegistrationFailed
+                      : string.IsNullOrEmpty(password)  ? MediusCallbackStatus.MediusInvalidPassword
+                      : BanFor(username, tcp) != null   ? MediusCallbackStatus.MediusAccountBanned
+                      : MediusCallbackStatus.MediusSuccess;
+        var account = regStatus == MediusCallbackStatus.MediusSuccess
+            ? _store.TryCreateAccount(username, PasswordHasher.Hash(password))
+            : null;
+        if (account == null && regStatus == MediusCallbackStatus.MediusSuccess)
+            regStatus = MediusCallbackStatus.MediusAccountAlreadyExists;
+
+        if (account == null)
         {
             // Use MediusAccountAlreadyExists (-999), not MediusAccountLoggedIn (-997).
             // The latter means "the account is currently in a session" — which is
@@ -374,13 +405,12 @@ public class MasServer : BaseMediusTcpServer
             var wFail = new MediusWriter();
             wFail.Write(msgId);                                                  // 21
             wFail.WritePadding(3);                                                // 3
-            wFail.Write((int)MediusCallbackStatus.MediusAccountAlreadyExists);    // 4
+            wFail.Write((int)regStatus);                                          // 4
             wFail.Write(0);                                                       // 4 — AccountID placeholder
             await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.AccountRegistrationResponse, wFail.ToArray()), ct);
             return;
         }
 
-        var account = _store.CreateAccount(username, HashPassword(password));
         _log.LogInformation("[MAS] Registered account '{User}' id={Id}", username, account.AccountId);
 
         var w = new MediusWriter();
@@ -399,6 +429,7 @@ public class MasServer : BaseMediusTcpServer
             : new byte[MediusConstants.MESSAGEID_MAXLEN];
 
         _log.LogInformation("[MAS] AccountLogout: {User}", state.AccountName);
+        _store.RevokeSession(state.SessionKey);
         state.AccountId   = null;
         state.AccountName = string.Empty;
         state.Status      = PlayerStatus.Disconnected;
@@ -424,18 +455,40 @@ public class MasServer : BaseMediusTcpServer
 
         _log.LogInformation("[MAS] TicketLogin: user={User}", username);
 
-        // Find or auto-create the account
-        MediusAccount? account = _store.GetAccountByName(username);
-        if (account == null)
+        if (!IsValidAccountName(username))
         {
-            account = _store.CreateAccount(username, string.Empty); // no password for ticket auth
+            await SendLoginFailure(tcp, MediusCallbackStatus.MediusAccountNotFound, msgId, ct, MediusLobbyMessageId.TicketLoginResponse);
+            return;
+        }
+        if (BanFor(username, tcp) is string banReason)
+        {
+            _log.LogWarning("[MAS] TicketLogin refused — '{User}' is banned ({Reason})", username, banReason);
+            await SendLoginFailure(tcp, MediusCallbackStatus.MediusAccountBanned, msgId, ct, MediusLobbyMessageId.TicketLoginResponse);
+            return;
+        }
+
+        // The ticket itself isn't validated, so it can't prove who the player is. It may claim a new name (the
+        // account is created without a password) or a password-less account, but an account protected by a
+        // password only accepts a session that already logged in to it with that password.
+        var account = _store.GetOrCreateAccount(username, string.Empty, out bool created);
+        if (created)
             _log.LogInformation("[MAS] Auto-created account for ticket login: '{User}' id={Id}", username, account.AccountId);
+        else if (!string.IsNullOrEmpty(account.PasswordHash) && !_store.IsSessionOf(sessionKey, account.AccountId))
+        {
+            _log.LogWarning("[MAS] TicketLogin refused — '{User}' has a password; use AccountLogin", username);
+            await SendLoginFailure(tcp, MediusCallbackStatus.MediusInvalidPassword, msgId, ct, MediusLobbyMessageId.TicketLoginResponse);
+            return;
+        }
+        if (account.IsBanned)
+        {
+            await SendLoginFailure(tcp, MediusCallbackStatus.MediusAccountBanned, msgId, ct, MediusLobbyMessageId.TicketLoginResponse);
+            return;
         }
 
         state.AccountId   = account.AccountId;
         state.AccountName = account.AccountName;
         state.Status      = PlayerStatus.InAuthWorld;
-        _store.RegisterSession(state.SessionKey, account.AccountId);
+        _store.RegisterSession(state.SessionKey, account.AccountId, replaceOthers: true);
 
         // TicketLoginResponse — wire format ported from horizon-server
         // RT.Models.Lobby.MediusTicketLoginResponse. Same NetConnectionInfo
@@ -603,7 +656,19 @@ public class MasServer : BaseMediusTcpServer
     // Helpers
     // -------------------------------------------------------------------------
 
-    private async Task SendLoginFailure(TcpClient tcp, MediusCallbackStatus status, byte[]? msgId, CancellationToken ct)
+    /// <summary>A name the client can log in with: not empty or blank.</summary>
+    private static bool IsValidAccountName(string name) => !string.IsNullOrWhiteSpace(name);
+
+    /// <summary>The reason <paramref name="accountName"/> (when given) or the connection's IP is banned, or null.</summary>
+    private string? BanFor(string? accountName, TcpClient tcp)
+    {
+        var ip = (tcp.Client.RemoteEndPoint as System.Net.IPEndPoint)?.Address;
+        var ban = (accountName != null ? _admin.Bans.FindAccount(accountName) : null) ?? _admin.Bans.FindIp(ip);
+        return ban == null ? null : (string.IsNullOrEmpty(ban.Reason) ? "banned" : ban.Reason);
+    }
+
+    private async Task SendLoginFailure(TcpClient tcp, MediusCallbackStatus status, byte[]? msgId, CancellationToken ct,
+        MediusLobbyMessageId responseType = MediusLobbyMessageId.AccountLoginResponse)
     {
         // Same response shape as the success path so the client's parser
         // doesn't choke on the size; only StatusCode differs. The MLS/NAT
@@ -624,19 +689,11 @@ public class MasServer : BaseMediusTcpServer
             sessionKey: "",
             accessKey: "");
 
-        await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.AccountLoginResponse, w.ToArray()), ct);
+        await SendMediusAsync(tcp, MediusPacket.BuildLobby(responseType, w.ToArray()), ct);
     }
 
-    private static string GenerateSessionKey()
-    {
-        return Guid.NewGuid().ToString("N")[..16].ToUpperInvariant();
-    }
-
-    private static string HashPassword(string password)
-    {
-        var bytes = SHA1.HashData(Encoding.UTF8.GetBytes(password));
-        return Convert.ToHexString(bytes).ToLowerInvariant();
-    }
+    /// <summary>16 hex chars from a CSPRNG: the key later stands in for the player on MLS and DME.</summary>
+    private static string GenerateSessionKey() => Convert.ToHexString(RandomNumberGenerator.GetBytes(8));
 }
 
 /// <summary>

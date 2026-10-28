@@ -16,6 +16,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="CodeDesigner.Ps2.Multiplayer.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Content Include="config.json">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
