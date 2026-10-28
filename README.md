@@ -1,3 +1,5 @@
+No custom firmware needed. 
+
 ![Fatality Development](docs/images/fatality-banner.webp)
 
 # SOCOM II Multiplayer
