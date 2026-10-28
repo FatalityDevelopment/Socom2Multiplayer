@@ -101,6 +101,27 @@ public partial class MlsServer
         var type = (MediusChatMessageType)Int(p, SessionBody);
         int targetId = Int(p, SessionBody + 4);
         string text = Str(p, SessionBody + 8, ChatLen);
+        await ForwardChatAsync(state, type, targetId, text, ct);
+    }
+
+    /// <summary>
+    /// GenericChatMessage (LobbyExt): the same SessionKey | pad2 | MessageType @40 | TargetID @44 | Text @48 request
+    /// with a longer text field. It used to be logged and dropped; it is now delivered like ChatMessage, as a
+    /// ChatFwdMessage (the forward this client is proven to display), so its text is cut to 64 characters.
+    /// </summary>
+    private Task HandleGenericChatAsync(MediusPacket packet, MediusClientState state, CancellationToken ct)
+    {
+        const int GenericChatLen = 512;
+        var p = packet.Payload;
+        var type = (MediusChatMessageType)Int(p, SessionBody);
+        int targetId = Int(p, SessionBody + 4);
+        string text = Str(p, SessionBody + 8, GenericChatLen);
+        return ForwardChatAsync(state, type, targetId, text.Length > ChatLen - 1 ? text[..(ChatLen - 1)] : text, ct);
+    }
+
+    /// <summary>Deliver one chat line from the sender to its recipients as ChatFwdMessage (no reply to the sender).</summary>
+    private async Task ForwardChatAsync(MediusClientState state, MediusChatMessageType type, int targetId, string text, CancellationToken ct)
+    {
         var me = Me(state);
         if (me == null) return;
 

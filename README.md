@@ -88,6 +88,18 @@ Connection and access settings (all optional):
 | `BriefingRooms[].Password` | empty | A room with a password only admits JoinChannel requests that present it |
 | `DebugApiPort` / `DebugApiToken` | `0` / empty | The localhost debug API. Every request must send an `X-Debug-Token` header (any value when no token is set) |
 
+Lobby settings (all optional):
+
+| Setting | Default | Notes |
+|---|---|---|
+| `ServerNews` / `Announcements` | welcome text / empty | The in-lobby news panel: `ServerNews` first, then each `Announcements` entry as its own item |
+| `ApplicationName` | `SOCOM II` | Shown in FindPlayer / find-room results |
+| `ApplyGameListFilters` | `false` | Apply the filters a console sets with SetGameListFilter0 to its game list. They are always logged; check the log before turning this on, because a wrong match hides games |
+
+Friends and clans need the other player's say. Adding a friend puts them on your list and leaves a buddy
+invitation for them, and the friendship becomes mutual when they add you back. A clan leader's "add player"
+sends an invitation, and the player joins once they accept it.
+
 Passwords are stored as salted PBKDF2 hashes. Older SHA-1 hashes still work and are upgraded at the next login.
 `TicketLogin` can create a new account or use a password-less one, but it can't log in to an account that has a
 password; those have to use the normal account login.

@@ -23,6 +23,11 @@ public class MediusAccount
     /// <summary>Buddy (friends) list — account ids.</summary>
     public List<int> Buddies      { get; set; } = new();
 
+    /// <summary>
+    /// Accounts that added this one as a friend and are waiting for it to add them back (GetBuddyInvitations).
+    /// </summary>
+    public List<int> BuddyRequestsFrom { get; set; } = new();
+
     /// <summary>Ignore list — account ids.</summary>
     public List<int> Ignores      { get; set; } = new();
 

@@ -21,6 +21,7 @@ public class MultiplayerConfig
         config.AllowedAppIds = ListOr(section, nameof(AllowedAppIds), new MultiplayerConfig().AllowedAppIds);
         config.BriefingRooms = ListOr(section, nameof(BriefingRooms), BriefingRoomConfig.RetailDefaults());
         config.DefaultGames  = ListOr(section, nameof(DefaultGames),  DefaultGameConfig.RetailDefaults());
+        config.Announcements = ListOr(section, nameof(Announcements), new List<string>());
         return config;
     }
 
@@ -260,6 +261,15 @@ public class MultiplayerConfig
         "- Check back here for the latest news and events.";
 
     /// <summary>
+    /// Extra in-lobby announcements, shown after <see cref="ServerNews"/> (each one is its own entry in the
+    /// GetAnnouncements list, up to 1000 characters). Empty = ServerNews only.
+    /// </summary>
+    public List<string> Announcements { get; set; } = new();
+
+    /// <summary>Application name returned in FindPlayer / FindWorldByName results.</summary>
+    public string ApplicationName { get; set; } = "SOCOM II";
+
+    /// <summary>
     /// Patch level announced in the universe entry (field 0x2B5 = "&lt;version&gt; &lt;url&gt;", split by the client
     /// with strtok(" \t")). A client whose built-in level differs (the r0001 disc) downloads
     /// <c>&lt;url&gt;APACHE00.ZDB</c> over HTTP and saves it to the memory card; a matching client logs straight in.
@@ -333,6 +343,13 @@ public class MultiplayerConfig
     /// to false if login regresses.
     /// </summary>
     public bool CommunityRetailReplies { get; set; } = false;
+
+    /// <summary>
+    /// Apply the filters a console sets with SetGameListFilter0 when building its game list. Off by default: the
+    /// filters are recorded and logged, but every game in the room is listed (the long-standing behaviour). Turn it
+    /// on once the logged filters look right for your game — a wrong match would hide games.
+    /// </summary>
+    public bool ApplyGameListFilters { get; set; } = false;
 
     // ── Binary injection ──────────────────────────────────────────────────────
 

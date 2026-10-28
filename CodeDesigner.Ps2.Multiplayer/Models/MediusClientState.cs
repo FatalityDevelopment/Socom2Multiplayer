@@ -107,6 +107,9 @@ public class MediusClientState
     // World placement
     // -------------------------------------------------------------------------
     public int? CurrentChannelId { get; set; }
+
+    /// <summary>Game-list filters this connection set (SetGameListFilter0), keyed by filter field.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<int, GameListFilter> GameListFilters { get; } = new();
     public int? CurrentGameId    { get; set; }
     public int? WorldId          { get; set; }
 

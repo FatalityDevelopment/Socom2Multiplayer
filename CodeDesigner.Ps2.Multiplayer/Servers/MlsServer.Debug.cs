@@ -133,7 +133,8 @@ public partial class MlsServer
                 var w = g.DmeWorldId is int wid ? DmeWorld.GetById(wid) : null;
                 sb.AppendLine($"    game 0x{g.GameId:X} '{g.GameName}' host {g.HostName}: {w?.ConnectedCount ?? g.PlayerCount}/{g.MaxPlayers}" +
                               (w is { SpectatorCount: > 0 } ? $" ({w.SpectatorCount} spectating)" : "") + (g.IsLocked ? " [password]" : "") +
-                              (g.IsSpectatorLocked ? " [spectator password]" : ""));
+                              (g.IsSpectatorLocked ? " [spectator password]" : "") +
+                              (g.Result is { } res ? $" [ended: team '{res.WinningTeam}', player '{res.WinningPlayer}', score {res.FinalScore}]" : ""));
             }
             foreach (var kv in _defaultGameWorlds.Where(kv => kv.Key >> 8 == room.ChannelId && DmeWorld.GetById(kv.Value.WorldId) == kv.Value && kv.Value.ConnectedCount > 0))
             {

@@ -9,6 +9,9 @@ public enum GameWorldStatus
     WorldPendingCreation   = 4,
 }
 
+/// <summary>How a game ended (EndGameReport): the winning team and player as the host reported them.</summary>
+public sealed record GameResult(string WinningTeam, string WinningPlayer, int FinalScore, DateTime EndedAt);
+
 /// <summary>A game session (world) that players can create or join.</summary>
 public class MediusGame
 {
@@ -42,6 +45,9 @@ public class MediusGame
     /// Null if no DME world has been allocated yet.
     /// </summary>
     public int?            DmeWorldId     { get; set; }
+
+    /// <summary>The host's EndGameReport, once the game has finished (null while it is running).</summary>
+    public GameResult?     Result         { get; set; }
 
     private readonly List<int> _playerIds = new();
     /// <summary>A copy of the roster (it changes from many connections at once).</summary>
