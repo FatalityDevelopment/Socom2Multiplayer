@@ -68,8 +68,14 @@ public partial class MlsServer
         int accountId = Int(p, SessionBody), minutes = Int(p, SessionBody + 4), worldId = Int(p, SessionBody + 8);
         if (worldId <= 0) worldId = state.CurrentGameId ?? 0;
         if (minutes <= 0) minutes = 120;
+        minutes = Math.Min(minutes, 60 * 24 * 365);   // AddMinutes(int.MaxValue) would throw
 
-        var status = accountId > 0 && worldId > 0 ? MediusCallbackStatus.MediusSuccess : MediusCallbackStatus.MediusInvalidRequestMsg;
+        // The voted-out console bans itself; otherwise only the game's host may ban someone from it.
+        bool allowed = state.AccountId is int sender
+                       && (sender == accountId || _store.GetGameById(worldId)?.HostAccountId == sender);
+        var status = accountId <= 0 || worldId <= 0 ? MediusCallbackStatus.MediusInvalidRequestMsg
+                   : !allowed                       ? MediusCallbackStatus.MediusFail
+                   : MediusCallbackStatus.MediusSuccess;
         if (status == MediusCallbackStatus.MediusSuccess)
             _gameBans.GetOrAdd(worldId, _ => new())[accountId] = DateTime.UtcNow.AddMinutes(minutes);
 
@@ -98,21 +104,26 @@ public partial class MlsServer
         var me = Me(state);
         if (me == null) return;
 
-        HashSet<int>? accounts = type switch
+        // Clan, buddy and ignore lists change under _store.Sync; read them under it too.
+        List<(MediusClientState State, TcpClient Client)> recipients;
+        lock (_store.Sync)
         {
-            MediusChatMessageType.Whisper                       => new HashSet<int> { targetId },
-            MediusChatMessageType.MediusClanChatType            => _store.GetClanById(me.ClanId)?.Members.ToHashSet() ?? new HashSet<int>(),
-            MediusChatMessageType.MediusBuddyChatType           => me.Buddies.ToHashSet(),
-            _                                                   => null,   // broadcast: by lobby world, below
-        };
+            HashSet<int>? accounts = type switch
+            {
+                MediusChatMessageType.Whisper                       => new HashSet<int> { targetId },
+                MediusChatMessageType.MediusClanChatType            => _store.GetClanById(me.ClanId)?.Members.ToHashSet() ?? new HashSet<int>(),
+                MediusChatMessageType.MediusBuddyChatType           => me.Buddies.ToHashSet(),
+                _                                                   => null,   // broadcast: by lobby world, below
+            };
 
-        var recipients = Clients.Values.Where(c =>
-            c.State.ConnectionId != state.ConnectionId
-            && c.State.IsSessionEstablished
-            && c.State.AccountId is int id && id != me.AccountId
-            && (type == MediusChatMessageType.BroadcastAcrossEntireUniverse
-                || (accounts != null ? accounts.Contains(id) : c.State.WorldId == state.WorldId))
-            && _store.GetAccountById(id)?.Ignores.Contains(me.AccountId) != true).ToList();
+            recipients = Clients.Values.Where(c =>
+                c.State.ConnectionId != state.ConnectionId
+                && c.State.IsSessionEstablished
+                && c.State.AccountId is int id && id != me.AccountId
+                && (type == MediusChatMessageType.BroadcastAcrossEntireUniverse
+                    || (accounts != null ? accounts.Contains(id) : c.State.WorldId == state.WorldId))
+                && _store.GetAccountById(id)?.Ignores.Contains(me.AccountId) != true).ToList();
+        }
 
         var fwd = new MediusWriter();
         fwd.WritePadding(MediusConstants.MESSAGEID_MAXLEN);   // MessageID (unsolicited)

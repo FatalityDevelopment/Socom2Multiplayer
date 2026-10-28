@@ -15,8 +15,9 @@ public class MediusChannel
 
     private readonly List<int> _playerIds = new();
 
-    public IReadOnlyList<int> PlayerIds => _playerIds;
-    public int PlayerCount => _playerIds.Count;
+    /// <summary>A copy of the roster (it changes from many connections at once).</summary>
+    public IReadOnlyList<int> PlayerIds { get { lock (_playerIds) return _playerIds.ToArray(); } }
+    public int PlayerCount { get { lock (_playerIds) return _playerIds.Count; } }
     public bool IsFull => PlayerCount >= MaxPlayers;
 
     public void AddPlayer(int accountId)    { lock (_playerIds) if (!_playerIds.Contains(accountId)) _playerIds.Add(accountId); }

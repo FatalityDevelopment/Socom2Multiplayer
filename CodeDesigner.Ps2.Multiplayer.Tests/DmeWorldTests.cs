@@ -2,6 +2,7 @@ using CodeDesigner.Ps2.Multiplayer.Models;
 
 namespace CodeDesigner.Ps2.Multiplayer.Tests;
 
+[Collection("DmeWorlds")]
 public class DmeWorldTests
 {
     [Fact]

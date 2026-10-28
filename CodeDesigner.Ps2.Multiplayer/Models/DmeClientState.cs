@@ -64,6 +64,9 @@ public class DmeClientState
     /// <summary>Whether a TCP connection is bound to this slot.</summary>
     public bool IsConnected { get; set; }
 
+    /// <summary>The DME connection bound to this slot (<see cref="DmeWorld.TryBind"/>).</summary>
+    public string? BoundConnectionId { get; set; }
+
     /// <summary>True once the DME connect handshake completed and the client takes part in relaying.</summary>
     public bool HasJoined { get; set; }
 

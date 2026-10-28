@@ -1,4 +1,5 @@
 using CodeDesigner.Ps2.Multiplayer.Config;
+using CodeDesigner.Ps2.Multiplayer.Models;
 using CodeDesigner.Ps2.Multiplayer.Servers;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -70,7 +71,7 @@ public class MultiplayerHostedService : IHostedService
         await _debug.StartAsync(ct);
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
+    public async Task StopAsync(CancellationToken cancellationToken)
     {
         _log.LogInformation("Shutting down multiplayer servers...");
         _cts.Cancel();
@@ -83,6 +84,13 @@ public class MultiplayerHostedService : IHostedService
         _nat.Stop();
         _patch.Stop();
         _debug.Stop();
-        return Task.CompletedTask;
+
+        // Let each connection's disconnect cleanup (presence, DME slots, games) finish before the host disposes
+        // the store, which writes the final snapshot.
+        var drain = TimeSpan.FromSeconds(5);
+        await Task.WhenAll(_muis.WaitForConnectionsAsync(drain), _mas.WaitForConnectionsAsync(drain),
+            _mls.WaitForConnectionsAsync(drain), _dme.WaitForConnectionsAsync(drain));
+        DmeWorld.DestroyAll();
+        _cts.Dispose();
     }
 }

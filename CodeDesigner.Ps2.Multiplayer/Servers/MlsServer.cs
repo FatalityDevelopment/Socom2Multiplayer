@@ -76,7 +76,64 @@ public partial class MlsServer : BaseMediusTcpServer
     public Task StartAsync(CancellationToken ct)
     {
         StartInjectDropWatcher(ct);
+        _ = RunMaintenanceLoopAsync(ct);
         return StartAsync(_config.BindAddress, _config.MlsPort, ct);
+    }
+
+    /// <summary>A JoinGame reservation the console never connects to the DME with is released after this.</summary>
+    internal static readonly TimeSpan ReservationTtl = TimeSpan.FromSeconds(60);
+
+    /// <summary>An empty game world (and its game-list row) is removed this long after its last player left.</summary>
+    internal static readonly TimeSpan EmptyWorldGrace = TimeSpan.FromSeconds(60);
+
+    private async Task RunMaintenanceLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(10));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                try { SweepGames(); }
+                catch (Exception ex) { _log.LogError(ex, "[MLS] Game sweep failed"); }
+            }
+        }
+        catch (OperationCanceledException) { /* shutdown */ }
+    }
+
+    /// <summary>
+    /// Release stale DME reservations, destroy empty game worlds, and drop games (with their host reports and
+    /// vote-out bans) whose world is gone. Runs every 10 s; also called from tests.
+    /// </summary>
+    internal void SweepGames()
+    {
+        foreach (var world in DmeWorld.Sweep(ReservationTtl, EmptyWorldGrace))
+            _log.LogInformation("[MLS] {World} swept: empty for {S}s", world, EmptyWorldGrace.TotalSeconds);
+
+        foreach (var g in _store.AllGames.ToList())
+        {
+            var gw = g.DmeWorldId is int wid ? DmeWorld.GetById(wid) : null;
+            if ((gw == null || gw.MediusWorldId != g.GameId) && DateTime.UtcNow - g.CreatedAt > EmptyWorldGrace)
+                RemoveGame(g, "DME world gone");
+        }
+
+        var liveWorlds = DmeWorld.All.Select(w => w.MediusWorldId).ToHashSet();
+        foreach (var id in _worldReports.Keys)
+            if (!liveWorlds.Contains(id)) _worldReports.TryRemove(id, out _);
+        foreach (var (id, bans) in _gameBans)
+        {
+            foreach (var (acct, until) in bans)
+                if (until <= DateTime.UtcNow) bans.TryRemove(acct, out _);
+            if (bans.IsEmpty) _gameBans.TryRemove(id, out _);
+        }
+    }
+
+    /// <summary>Remove a player game and everything keyed by its MediusWorldID.</summary>
+    private void RemoveGame(MediusGame game, string reason)
+    {
+        if (!_store.RemoveGame(game.GameId)) return;
+        _worldReports.TryRemove(game.GameId, out _);
+        _gameBans.TryRemove(game.GameId, out _);
+        _log.LogInformation("[MLS] Game 0x{Id:X} '{Name}' removed ({Reason})", game.GameId, game.GameName, reason);
     }
 
     // Fire the SCERT session-established callback right after the old-proto handshake so
@@ -597,6 +654,7 @@ public partial class MlsServer : BaseMediusTcpServer
         {
             var ch = _store.GetOrCreateChannel(r.WorldId, r.Name, appId, r.MaxPlayers);
             ch.SecurityLevel = r.SecurityLevel;
+            ch.Password      = r.Password ?? string.Empty;
             ch.GenericField1 = unchecked((int)r.GenericField);
             return ch;
         }).ToList();
@@ -642,7 +700,7 @@ public partial class MlsServer : BaseMediusTcpServer
         var channel = _store.GetChannelById(worldId);
         var status =
             channel == null                                          ? MediusCallbackStatus.MediusChannelNotFound
-            : channel.SecurityLevel != 0 && password != channel.Password ? MediusCallbackStatus.MediusInvalidPassword
+            : channel.Password.Length > 0 && password != channel.Password ? MediusCallbackStatus.MediusInvalidPassword
             : channel.IsFull                                         ? MediusCallbackStatus.MediusWorldIsFull
             : MediusCallbackStatus.MediusSuccess;
 
@@ -653,7 +711,13 @@ public partial class MlsServer : BaseMediusTcpServer
 
         if (status == MediusCallbackStatus.MediusSuccess)
         {
-            if (state.AccountId.HasValue) channel!.AddPlayer(state.AccountId.Value);
+            if (state.AccountId is int joiner)
+            {
+                // Hopping rooms: leave the previous one, or its roster (and IsFull) keeps counting this player.
+                if (state.CurrentChannelId is int previous && previous != channel!.ChannelId)
+                    _store.GetChannelById(previous)?.RemovePlayer(joiner);
+                channel!.AddPlayer(joiner);
+            }
             state.CurrentChannelId = channel!.ChannelId;
             state.Status           = PlayerStatus.InChatWorld;
 
@@ -715,10 +779,9 @@ public partial class MlsServer : BaseMediusTcpServer
         {
             // A player game whose DME world emptied out (host left) is gone — drop it from the list.
             var gw = g.DmeWorldId is int wid ? DmeWorld.GetById(wid) : null;
-            if ((gw == null || gw.MediusWorldId != g.GameId) && DateTime.UtcNow - g.CreatedAt > TimeSpan.FromSeconds(60))
+            if ((gw == null || gw.MediusWorldId != g.GameId) && DateTime.UtcNow - g.CreatedAt > EmptyWorldGrace)
             {
-                _store.RemoveGame(g.GameId);
-                _log.LogInformation("[MLS] Game 0x{Id:X} '{Name}' removed (DME world gone)", g.GameId, g.GameName);
+                RemoveGame(g, "DME world gone");
                 continue;
             }
             if (room != null && g.LobbyChannelId != 0 && g.LobbyChannelId != room.ChannelId)
@@ -884,7 +947,23 @@ public partial class MlsServer : BaseMediusTcpServer
             password.Length > 0 ? (spectatorPassword.Length > 0 ? "game+spectator" : "game") : spectatorPassword.Length > 0 ? "spectator" : "none",
             state.WorldId ?? 0);
 
-        var game = _store.CreateGame(gameName, state.AppId, state.AccountId ?? 0, state.AccountName, maxPlayers);
+        // A DME world holds 1..32 players; keep the listed limits consistent with it.
+        maxPlayers = Math.Clamp(maxPlayers, 1, DmeWorld.MaxClientsPerWorld);
+        minPlayers = Math.Clamp(minPlayers, 0, maxPlayers);
+        // Games are listed per briefing room. The community connection's world (1) is no room: list those everywhere.
+        int lobbyId = state.WorldId is int lw && _store.GetChannelById(lw) != null ? lw : 0;
+        int hostId  = state.AccountId ?? 0;
+
+        bool nameTaken = _store.GetGames(state.AppId).Any(g =>
+            g.LobbyChannelId == lobbyId && g.HostAccountId != hostId
+            && string.Equals(BaseGameName(g.GameName), BaseGameName(gameName), StringComparison.OrdinalIgnoreCase));
+        if (nameTaken)
+        {
+            await SendCreateGameFailureAsync(packet, state, tcp, MediusCallbackStatus.MediusGameNameExists, gameName, ct);
+            return;
+        }
+
+        var game = _store.CreateGame(gameName, state.AppId, hostId, state.AccountName, maxPlayers);
         game.MinPlayers       = minPlayers;
         game.GameLevel        = gameLevel;
         game.PlayerSkillLevel = skillLevel;
@@ -896,11 +975,17 @@ public partial class MlsServer : BaseMediusTcpServer
         game.GenericField3    = generic[2];
         game.GenericField4    = generic[3];
         game.GameHostType     = hostType;
-        game.LobbyChannelId   = state.WorldId ?? 0;
+        game.LobbyChannelId   = lobbyId;
         game.GameStats[0]     = (byte)game.LobbyChannelId;
         game.GameStats[6]     = 0x7F;                // retail player-made games carry index 0x7F
 
-        var world = DmeServer.CreateWorld(game.GameId, state.AppId, maxPlayers);
+        var world = DmeServer.TryCreateWorld(game.GameId, state.AppId, maxPlayers);
+        if (world == null)
+        {
+            RemoveGame(game, "no free DME world id");
+            await SendCreateGameFailureAsync(packet, state, tcp, MediusCallbackStatus.MediusFail, gameName, ct);
+            return;
+        }
         world.SelfDestructFlag = true;
         game.DmeWorldId = world.WorldId;
 
@@ -910,6 +995,24 @@ public partial class MlsServer : BaseMediusTcpServer
 
         _log.LogInformation("[MLS] CreateGame -> world 0x{Id:X} ({World})", game.GameId, world);
         await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.CreateGameResponse, w.ToArray()), state, ct);
+    }
+
+    /// <summary>CreateGameResponse with a failure status: same size as success (MediusWorldID 0).</summary>
+    private async Task SendCreateGameFailureAsync(MediusPacket packet, MediusClientState state, TcpClient tcp,
+        MediusCallbackStatus status, string gameName, CancellationToken ct)
+    {
+        var w = new MediusWriter();
+        WriteMlsHeader(w, packet, status);
+        w.Write(0);
+        _log.LogInformation("[MLS] CreateGame '{Name}' -> {Status}", gameName, status);
+        await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.CreateGameResponse, w.ToArray()), state, ct);
+    }
+
+    /// <summary>A game name without the "$~room" suffix the list adds.</summary>
+    private static string BaseGameName(string name)
+    {
+        int cut = name.IndexOf("$~", StringComparison.Ordinal);
+        return (cut >= 0 ? name[..cut] : name).Trim();
     }
 
     /// <summary>
@@ -951,7 +1054,13 @@ public partial class MlsServer : BaseMediusTcpServer
         if (status == MediusCallbackStatus.MediusSuccess)
         {
             slot = world!.Reserve(sessionKey, state.AccountId ?? 0, spectator);
-            if (slot == null) status = MediusCallbackStatus.MediusWorldIsFull;
+            // The world can be swept between the lookup and the reservation; a fresh one takes the join.
+            if (slot == null && world.IsDestroyed)
+            {
+                world = game != null ? GetOrCreatePlayerGameWorld(game) : GetOrCreateDefaultGameWorld(worldId, state.AppId);
+                slot = world?.Reserve(sessionKey, state.AccountId ?? 0, spectator);
+            }
+            if (slot == null) status = world == null ? MediusCallbackStatus.MediusGameNotFound : MediusCallbackStatus.MediusWorldIsFull;
         }
 
         var w = new MediusWriter();
@@ -959,7 +1068,13 @@ public partial class MlsServer : BaseMediusTcpServer
         w.Write(game?.GameHostType ?? 0);                                   // GameHostType (retail defaults: 0)
         if (slot != null)
         {
-            if (state.AccountId.HasValue) game?.AddPlayer(state.AccountId.Value);
+            if (state.AccountId is int member)
+            {
+                // Joining another game: leave the previous one, or its player count stays inflated.
+                if (state.CurrentGameId is int previous && previous != worldId)
+                    _store.GetGameById(previous)?.RemovePlayer(member);
+                game?.AddPlayer(member);
+            }
             state.CurrentGameId = worldId;
             state.Status        = PlayerStatus.InGameWorld;
             if (state.AccountId is int joiner)
@@ -1011,7 +1126,12 @@ public partial class MlsServer : BaseMediusTcpServer
         {
             if (_defaultGameWorlds.TryGetValue(mediusWorldId, out var existing) && DmeWorld.GetById(existing.WorldId) == existing)
                 return existing;
-            var world = DmeServer.CreateWorld(mediusWorldId, appId, DefaultGameMaxPlayers);
+            var world = DmeServer.TryCreateWorld(mediusWorldId, appId, DefaultGameMaxPlayers);
+            if (world == null)
+            {
+                _log.LogWarning("[MLS] No free DME world id for default room 0x{Id:X}", mediusWorldId);
+                return null;
+            }
             world.SelfDestructFlag = true;
             _defaultGameWorlds[mediusWorldId] = world;
             _gameBans.TryRemove(mediusWorldId, out _);   // a fresh session of a default room starts with no vote-outs
@@ -1021,12 +1141,18 @@ public partial class MlsServer : BaseMediusTcpServer
 
     private static DmeWorld? GetOrCreatePlayerGameWorld(MediusGame game)
     {
-        if (game.DmeWorldId is int id && DmeWorld.GetById(id) is { } world && world.MediusWorldId == game.GameId)
-            return world;
-        var created = DmeServer.CreateWorld(game.GameId, game.AppId, game.MaxPlayers);
-        created.SelfDestructFlag = true;
-        game.DmeWorldId = created.WorldId;
-        return created;
+        // Two joins racing on a game whose world died must not each create one (the first joiner would be
+        // left reserved in an orphan).
+        lock (game)
+        {
+            if (game.DmeWorldId is int id && DmeWorld.GetById(id) is { } world && world.MediusWorldId == game.GameId)
+                return world;
+            var created = DmeServer.TryCreateWorld(game.GameId, game.AppId, game.MaxPlayers);
+            if (created == null) return null;
+            created.SelfDestructFlag = true;
+            game.DmeWorldId = created.WorldId;
+            return created;
+        }
     }
 
     /// <summary>Retail default rooms list 2–24 players.</summary>
@@ -1252,7 +1378,8 @@ public partial class MlsServer : BaseMediusTcpServer
 
             if (ladderType == (int)MediusLadderType.MediusLadderTypeClan)
             {
-                if (_store.GetClanById(account.ClanId) is { } clan) clan.LadderStats = stats;
+                if (_store.GetClanById(account.ClanId) is { } clan && clan.LeaderAccountId == account.AccountId)
+                    clan.LadderStats = stats;
             }
             else
             {
@@ -1392,15 +1519,28 @@ public partial class MlsServer : BaseMediusTcpServer
             PlayerSkillLevel: r.ReadInt32(), RulesSet: r.ReadInt32(), GenericField1: r.ReadInt32(),
             GenericField2: r.ReadInt32(), GenericField3: r.ReadInt32(), WorldStatus: r.ReadInt32());
 
+        // Only a player in that game world (or the game's host) may describe it; anyone else could rename or
+        // close other people's games.
+        var reportedGame = _store.GetGameById(worldId);
+        if (state.AccountId is not int reporter
+            || (reportedGame?.HostAccountId != reporter
+                && !DmeWorld.All.Any(w => w.MediusWorldId == worldId && w.Clients.Values.Any(c => c.AccountId == reporter))))
+        {
+            _log.LogDebug("[MLS] WorldReport0 for world 0x{World:X} from {Acct} ignored: not in that game", worldId, state.AccountName);
+            return;
+        }
+
         bool first = !_worldReports.ContainsKey(worldId);
         _worldReports[worldId] = report;
 
-        if (_store.GetGameById(worldId) is { } game)
+        if (reportedGame is { } game)
         {
             game.GameName         = report.GameName;
             game.GameStats        = report.GameStats;
             game.MinPlayers       = report.MinPlayers;
-            game.MaxPlayers       = report.MaxPlayers;
+            // The DME world's slot count is fixed at creation; never list more seats than it has.
+            int seats = game.DmeWorldId is int dw && DmeWorld.GetById(dw) is { } gw ? gw.MaxPlayers : DmeWorld.MaxClientsPerWorld;
+            game.MaxPlayers       = Math.Clamp(report.MaxPlayers, 1, seats);
             game.GameLevel        = report.GameLevel;
             game.PlayerSkillLevel = report.PlayerSkillLevel;
             game.RulesSet         = report.RulesSet;

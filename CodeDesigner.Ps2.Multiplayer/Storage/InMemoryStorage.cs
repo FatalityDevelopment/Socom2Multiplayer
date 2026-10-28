@@ -23,6 +23,11 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
     private readonly Timer? _saveTimer;
     private int _dirty;
 
+    /// <summary>Debounce for snapshot writes, and the longest a change may wait under constant activity.</summary>
+    private static readonly TimeSpan SaveDebounce = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan MaxSaveDelay = TimeSpan.FromSeconds(30);
+    private long _firstDirtyTicks;   // when the pending (unsaved) changes started; 0 = nothing pending
+
     /// <summary>Lock for multi-step social/clan mutations (friends, ignores, clan membership, invitations).</summary>
     public object Sync { get; } = new();
 
@@ -242,6 +247,9 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
     public IEnumerable<MediusGame> GetGames(int appId) =>
         _gamesById.Values.Where(g => g.AppId == appId && g.Status != GameWorldStatus.WorldInactive);
 
+    /// <summary>Every game, including ones whose host reported them inactive (housekeeping).</summary>
+    public IEnumerable<MediusGame> AllGames => _gamesById.Values;
+
     public MediusGame? GetGameById(int id) =>
         _gamesById.TryGetValue(id, out var g) ? g : null;
 
@@ -278,12 +286,20 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
         public List<MediusClanInvitation> Invitations { get; set; } = new();
     }
 
-    /// <summary>Schedule a snapshot write (debounced — many changes in a burst cost one write).</summary>
+    /// <summary>
+    /// Schedule a snapshot write (debounced — many changes in a burst cost one write). Under constant activity the
+    /// debounce would keep moving, so a write is forced once changes have waited <see cref="MaxSaveDelay"/>.
+    /// </summary>
     public void MarkDirty()
     {
         if (_saveTimer == null) return;
         Interlocked.Exchange(ref _dirty, 1);
-        _saveTimer.Change(TimeSpan.FromSeconds(2), Timeout.InfiniteTimeSpan);
+        long now = DateTime.UtcNow.Ticks;
+        Interlocked.CompareExchange(ref _firstDirtyTicks, now, 0);
+        var waited = TimeSpan.FromTicks(now - Interlocked.Read(ref _firstDirtyTicks));
+        var delay  = waited >= MaxSaveDelay ? TimeSpan.Zero : SaveDebounce;
+        try { _saveTimer.Change(delay, Timeout.InfiniteTimeSpan); }
+        catch (ObjectDisposedException) { /* shutting down: Dispose writes the snapshot */ }
     }
 
     /// <summary>Write the snapshot now if anything changed.</summary>
@@ -292,11 +308,13 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
     private void SaveIfDirty()
     {
         if (_snapshotPath == null || Interlocked.Exchange(ref _dirty, 0) == 0) return;
+        Interlocked.Exchange(ref _firstDirtyTicks, 0);
         try
         {
             string json;
             lock (Sync)
             {
+                // Serialized while holding Sync: the friend/ignore/clan lists only change under it.
                 json = JsonSerializer.Serialize(new Snapshot
                 {
                     NextAccountId     = Volatile.Read(ref _nextAccountId),
@@ -308,21 +326,26 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
                     Invitations       = _invitationsById.Values.OrderBy(i => i.InvitationId).ToList(),
                 }, JsonOptions);
             }
-            var tmp = _snapshotPath + ".tmp";
-            File.WriteAllText(tmp, json);
-            File.Move(tmp, _snapshotPath, overwrite: true);   // atomic replace — never a half-written file
+            // Keep the previous good snapshot as .bak: Load falls back to it if the main file is ever unreadable.
+            if (File.Exists(_snapshotPath))
+                File.Copy(_snapshotPath, _snapshotPath + ".bak", overwrite: true);
+            AtomicFile.WriteAllText(_snapshotPath, json);
         }
         catch (Exception ex)
         {
+            _log?.LogError(ex, "[Store] Saving {Path} failed — retrying", _snapshotPath);
+            // Re-arm (slowly), or the changes would wait for the next unrelated write.
             Interlocked.Exchange(ref _dirty, 1);
-            _log?.LogError(ex, "[Store] Saving {Path} failed", _snapshotPath);
+            try { _saveTimer?.Change(MaxSaveDelay, Timeout.InfiniteTimeSpan); }
+            catch (ObjectDisposedException) { /* shutting down */ }
         }
     }
 
     private void Load()
     {
-        if (_snapshotPath == null || !File.Exists(_snapshotPath)) return;
-        var snap = JsonSerializer.Deserialize<Snapshot>(File.ReadAllText(_snapshotPath), JsonOptions) ?? new Snapshot();
+        if (_snapshotPath == null) return;
+        var snap = ReadSnapshot(_snapshotPath) ?? ReadSnapshot(_snapshotPath + ".bak");
+        if (snap == null) return;
 
         foreach (var a in snap.Accounts)
         {
@@ -340,6 +363,27 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
 
         _log?.LogInformation("[Store] Loaded {Accounts} accounts, {Clans} clans from {Path}",
             _accountsById.Count, _clansById.Count, _snapshotPath);
+    }
+
+    /// <summary>Read one snapshot file; null if it is missing or unreadable (logged).</summary>
+    private Snapshot? ReadSnapshot(string path)
+    {
+        if (!File.Exists(path)) return null;
+        try
+        {
+            var snap = JsonSerializer.Deserialize<Snapshot>(File.ReadAllText(path), JsonOptions);
+            if (snap != null && path.EndsWith(".bak", StringComparison.Ordinal))
+                _log?.LogWarning("[Store] Main snapshot unreadable — restored from {Path}", path);
+            return snap;
+        }
+        catch (Exception ex) when (ex is JsonException or IOException or NotSupportedException)
+        {
+            _log?.LogError("[Store] {Path} is unreadable: {Msg}", path, ex.Message);
+            // Keep the bad file for inspection; the next save would overwrite it.
+            try { File.Copy(path, path + ".corrupt-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss"), overwrite: true); }
+            catch (IOException) { /* best effort */ }
+            return null;
+        }
     }
 
     public void Dispose()
