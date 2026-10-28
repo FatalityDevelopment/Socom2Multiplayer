@@ -30,6 +30,7 @@ public class MasServer : BaseMediusTcpServer
     {
         _admin     = admin;
         _config    = config;
+        MediusWriterExtensions.Trim154 = config.WireFixes.NetConnectionInfo154;
         _store     = store;
         _log       = log;
         ServerName = "MAS";
@@ -187,6 +188,7 @@ public class MasServer : BaseMediusTcpServer
 
         var w = new MediusWriter();
         w.Write(msgId);                                                       // messageId echo (21 bytes)
+        if (_config.WireFixes.MasExtendedSessionBeginPad) w.WritePadding(3);  // same pad as SessionBeginResponse
         w.Write((int)MediusCallbackStatus.MediusSuccess);
         w.WriteString(state.SessionKey, MediusConstants.SESSIONKEY_MAXLEN);  // SessionKey (17 bytes)
 
@@ -509,11 +511,15 @@ public class MasServer : BaseMediusTcpServer
             mls: (NetAddressType.External,   _config.ServerIp, _config.MlsPort),
             nat: (NetAddressType.NATService, _config.ServerIp, _config.NatPort),
             worldId: defaultWorldId,
-            serverKey: null,
+            serverKey: _config.WireFixes.TicketLoginEncrypted ? Ps2Rsa.ServerKey.GetPublicKey() : null,
             sessionKey: state.SessionKey,
             accessKey: state.SessionKey);   // reuse session key as token placeholder
 
-        await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.TicketLoginResponse, w.ToArray()), ct);
+        var ticketReply = MediusPacket.BuildLobby(MediusLobbyMessageId.TicketLoginResponse, w.ToArray());
+        if (_config.WireFixes.TicketLoginEncrypted)
+            await SendMediusAsync(tcp, ticketReply, state, ct);   // encrypted, like AccountLoginResponse
+        else
+            await SendMediusAsync(tcp, ticketReply, ct);
     }
 
     private async Task HandleGetMyIpAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
@@ -730,6 +736,9 @@ internal enum NetConnectionType : int
 // ---------------------------------------------------------------------------
 internal static class MediusWriterExtensions
 {
+    /// <summary>Set at startup from <see cref="WireFixesConfig.NetConnectionInfo154"/>.</summary>
+    public static bool Trim154 { get; set; }
+
     /// <summary>
     /// Write a single NetAddress block (24 bytes):
     ///   [type:4 int LE][address:16 ASCII null-padded][port:4 uint LE]
@@ -815,7 +824,8 @@ internal static class MediusWriterExtensions
         // ONLY message we send that carries a NetConnectionInfo — and SOCOM II rejects it
         // every time. If the PS2 parser expects those 2 bytes, our block is a 2-byte short
         // read here and nowhere else, which fits the symptom exactly. Total = 156 bytes.
-        w.WritePadding(2);
+        // WireFixes.NetConnectionInfo154 drops them again (the v108 size) for testing.
+        if (!Trim154) w.WritePadding(2);
     }
 
     /// <summary>

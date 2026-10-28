@@ -120,6 +120,26 @@ DNAS settings (all optional):
 The DNAS code doesn't replay these packets. It runs a live exchange for every session. From a title's captured S1
 it takes only the original 128-byte signed ticket, which the retail client checks.
 
+### Wire-format fixes to test on hardware
+
+Some replies don't match the horizon layouts. The fixes are written, but they haven't been confirmed on a console,
+so each one sits behind a flag under `WireFixes` that is off by default. With every flag off the server behaves
+as it did before. Turn on one flag at a time, for example `Online__WireFixes__MlsHeaderEcho=true`, or
+`"WireFixes": { "MlsHeaderEcho": true }` inside `Online` in `config.json`. Then run the check for that flag. If
+anything regresses, turn the flag back off.
+
+| Flag | What changes | What to check |
+|---|---|---|
+| `NetConnectionInfo154` | Login, JoinChannel and JoinGame replies carry the 154-byte v108 NetConnectionInfo instead of 156 bytes | Log in, enter a briefing room, create a game and join a game. This touches the most important replies, so test it first and on its own |
+| `MlsHeaderEcho` | Several MLS replies get the MessageID echo header: SessionBegin, AccountLogout, GetLocations, PickLocation, UtilGetServerVersion and the LobbyExt list replies | Log in, stay on the community screen past 2 minutes, enter and leave rooms, log out |
+| `EmptyGameListEndOfList` | An empty game list is one full 0x190-byte row | Enter a room with no games (set `DefaultGames` to `[]`). The list should show empty, with no stall or disconnect |
+| `MasExtendedSessionBeginPad` | ExtendedSessionBeginResponse gets the 3-byte pad | Only matters for clients that send ExtendedSessionBegin. SOCOM II normally sends SessionBegin |
+| `TicketLoginEncrypted` | TicketLoginResponse carries the server key and is encrypted | Only matters for clients that log in with TicketLogin |
+| `MuisLegacyGetUniverse` | A Lobby-class GetUniverse on MUIS gets the 0x120-byte GetUniverseResponse body | Only matters for clients that send the Lobby-class GetUniverse. SOCOM II uses the LobbyExt form |
+
+`ApplyGameListFilters` works the same way. The console's filters are logged as `SetGameListFilter0 …` lines;
+turn it on only once those lines match how you expect your rooms to be filtered.
+
 ## Cloud deployment
 
 See [deploy/azure/README.md](deploy/azure/README.md). It covers Azure Container Instances, which can expose UDP ports.

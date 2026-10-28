@@ -351,6 +351,9 @@ public class MultiplayerConfig
     /// </summary>
     public bool ApplyGameListFilters { get; set; } = false;
 
+    /// <summary>Unconfirmed wire-format corrections, each off by default (see <see cref="WireFixesConfig"/>).</summary>
+    public WireFixesConfig WireFixes { get; set; } = new();
+
     // ── Binary injection ──────────────────────────────────────────────────────
 
     /// <summary>

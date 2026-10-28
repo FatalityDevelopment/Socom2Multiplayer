@@ -501,8 +501,18 @@ public partial class MlsServer : BaseMediusTcpServer
             _store.RegisterSession(state.SessionKey, account.AccountId);
 
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
-        w.WriteString(state.SessionKey, 64);
+        if (_config.WireFixes.MlsHeaderEcho)
+        {
+            // The MAS SessionBeginResponse layout: header | SessionKey[17] | pad3.
+            WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+            w.WriteString(state.SessionKey, MediusConstants.SESSIONKEY_MAXLEN);
+            w.WritePadding(3);
+        }
+        else
+        {
+            w.Write((int)MediusCallbackStatus.MediusSuccess);
+            w.WriteString(state.SessionKey, 64);
+        }
 
         await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.SessionBeginResponse, w.ToArray()), ct);
     }
@@ -517,7 +527,8 @@ public partial class MlsServer : BaseMediusTcpServer
         state.AccountId   = null;
         state.AccountName = string.Empty;
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
+        if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+        else w.Write((int)MediusCallbackStatus.MediusSuccess);
         await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.AccountLogoutResponse, w.ToArray()), ct);
     }
 
@@ -550,7 +561,8 @@ public partial class MlsServer : BaseMediusTcpServer
     {
         // Universe variable info — send a minimal response
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
+        if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+        else w.Write((int)MediusCallbackStatus.MediusSuccess);
         w.Write((byte)1);  // End of list
         w.WriteString(_config.UniverseName, 64);
         w.WriteString(_config.EffectivePatchUrl, 128);
@@ -673,7 +685,8 @@ public partial class MlsServer : BaseMediusTcpServer
             bool isLast = i == channels.Count - 1;
 
             var w = new MediusWriter();
-            w.Write((int)MediusCallbackStatus.MediusSuccess);
+            if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+            else w.Write((int)MediusCallbackStatus.MediusSuccess);
             w.Write((byte)(isLast ? 1 : 0));
             w.Write(ch.ChannelId);
             w.WriteString(ch.ChannelName, 64);
@@ -683,7 +696,11 @@ public partial class MlsServer : BaseMediusTcpServer
             w.Write(ch.GenericField2);
             w.Write(ch.GenericField3);
 
-            await SendMediusAsync(tcp, MediusPacket.BuildLobbyExt(MediusLobbyExtMessageId.ChannelList_ExtraInfo, w.ToArray()), ct);
+            // Without the fix the reply goes out under the REQUEST type (0x1F).
+            var reply = _config.WireFixes.MlsHeaderEcho
+                ? MediusPacket.BuildLobby(MediusLobbyMessageId.ChannelList_ExtraInfoResponse, w.ToArray())
+                : MediusPacket.BuildLobbyExt(MediusLobbyExtMessageId.ChannelList_ExtraInfo, w.ToArray());
+            await SendMediusAsync(tcp, reply, ct);
         }
     }
 
@@ -800,7 +817,8 @@ public partial class MlsServer : BaseMediusTcpServer
         {
             // No games in the room is a normal retail state — reply with the proven empty-list body.
             var wEmpty = new MediusWriter();
-            WriteEmptyListBody(wEmpty, packet);
+            if (_config.WireFixes.EmptyGameListEndOfList) WriteEmptyGameListRow(wEmpty, packet);
+            else WriteEmptyListBody(wEmpty, packet);
             await SendMediusAsync(tcp, MediusPacket.BuildLobby(responseType, wEmpty.ToArray()), ct);
             return;
         }
@@ -918,7 +936,8 @@ public partial class MlsServer : BaseMediusTcpServer
         if (games.Count == 0)
         {
             var wEmpty = new MediusWriter();
-            wEmpty.Write((int)MediusCallbackStatus.MediusNoResult);
+            if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(wEmpty, packet, MediusCallbackStatus.MediusNoResult);
+            else wEmpty.Write((int)MediusCallbackStatus.MediusNoResult);
             wEmpty.Write((byte)1);
             await SendMediusAsync(tcp, MediusPacket.BuildLobbyExt(MediusLobbyExtMessageId.GameList_ExtraInfoResponse, wEmpty.ToArray()), ct);
             return;
@@ -928,7 +947,7 @@ public partial class MlsServer : BaseMediusTcpServer
         {
             var g = games[i];
             bool isLast = i == games.Count - 1;
-            await SendGameListEntryExt(tcp, g, isLast, ct);
+            await SendGameListEntryExt(tcp, packet, g, isLast, ct);
         }
     }
 
@@ -1210,6 +1229,15 @@ public partial class MlsServer : BaseMediusTcpServer
     /// likely garbage IDs behind the disconnect. We zero-pad past the largest entry struct so any
     /// field the parser still touches reads clean zeros instead of leftover buffer.
     /// </summary>
+    /// <summary>An empty game list as one full 0x190-byte row: NoResult, zeroed fields, EndOfList at 0x18C like a real row.</summary>
+    internal static void WriteEmptyGameListRow(MediusWriter w, MediusPacket packet)
+    {
+        WriteMlsHeader(w, packet, MediusCallbackStatus.MediusNoResult);   // 0x00 .. 0x1C
+        w.WritePadding(0x18C - 0x1C);                                     // row fields, all zero
+        w.Write((byte)1);                                                 // 0x18C EndOfList
+        w.WritePadding(3);                                                // → 0x190
+    }
+
     private static void WriteEmptyListBody(MediusWriter w, MediusPacket packet)
     {
         WriteMlsHeader(w, packet, MediusCallbackStatus.MediusNoResult);  // msgId + pad + status
@@ -1718,10 +1746,22 @@ public partial class MlsServer : BaseMediusTcpServer
     private async Task HandleGetLocationsAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
-        w.Write((byte)1);   // EndOfList
-        w.Write(0);         // LocationId
-        w.WriteString("Default", 64);
+        if (_config.WireFixes.MlsHeaderEcho)
+        {
+            // header | LocationID | LocationName[64] | EndOfList | pad3
+            WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+            w.Write(0);
+            w.WriteString(_config.UniverseName, 64);
+            w.Write((byte)1);
+            w.WritePadding(3);
+        }
+        else
+        {
+            w.Write((int)MediusCallbackStatus.MediusSuccess);
+            w.Write((byte)1);   // EndOfList
+            w.Write(0);         // LocationId
+            w.WriteString("Default", 64);
+        }
 
         await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.GetLocationsResponse, w.ToArray()), ct);
     }
@@ -1729,7 +1769,8 @@ public partial class MlsServer : BaseMediusTcpServer
     private async Task HandlePickLocationAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
+        if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+        else w.Write((int)MediusCallbackStatus.MediusSuccess);
 
         await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.PickLocationResponse, w.ToArray()), ct);
     }
@@ -1763,8 +1804,9 @@ public partial class MlsServer : BaseMediusTcpServer
     private async Task HandleUtilGetServerVersionAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
-        w.WriteString("CodeDesigner MLS 1.0", 64);
+        if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+        else w.Write((int)MediusCallbackStatus.MediusSuccess);
+        w.WriteString(_config.WireFixes.MlsHeaderEcho ? RetailLobbyServerVersion : "CodeDesigner MLS 1.0", 64);
 
         await SendMediusAsync(tcp, MediusPacket.BuildLobbyExt(MediusLobbyExtMessageId.UtilGetServerVersionResponse, w.ToArray()), ct);
     }
@@ -1773,10 +1815,11 @@ public partial class MlsServer : BaseMediusTcpServer
     // Private helpers
     // -------------------------------------------------------------------------
 
-    private async Task SendGameListEntryExt(TcpClient tcp, MediusGame g, bool isLast, CancellationToken ct)
+    private async Task SendGameListEntryExt(TcpClient tcp, MediusPacket packet, MediusGame g, bool isLast, CancellationToken ct)
     {
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
+        if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+        else w.Write((int)MediusCallbackStatus.MediusSuccess);
         w.Write((byte)(isLast ? 1 : 0));
         w.Write(g.GameId);
         w.WriteString(g.GameName, 64);
