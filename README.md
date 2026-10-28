@@ -1,3 +1,5 @@
+![Fatality Development](docs/images/fatality-banner.webp)
+
 # SOCOM II Multiplayer
 
 A private online server for SOCOM U.S. Navy SEALs II (PS2) in a single container. It runs:
