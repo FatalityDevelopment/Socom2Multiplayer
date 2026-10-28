@@ -9,6 +9,9 @@ public enum GameWorldStatus
     WorldPendingCreation   = 4,
 }
 
+/// <summary>How a game ended (EndGameReport): the winning team and player as the host reported them.</summary>
+public sealed record GameResult(string WinningTeam, string WinningPlayer, int FinalScore, DateTime EndedAt);
+
 /// <summary>A game session (world) that players can create or join.</summary>
 public class MediusGame
 {
@@ -20,7 +23,7 @@ public class MediusGame
     public string          HostName       { get; set; } = string.Empty;
     public int             MinPlayers     { get; set; } = 2;
     public int             MaxPlayers     { get; set; } = 8;
-    public int             PlayerCount    => _playerIds.Count;
+    public int             PlayerCount    { get { lock (_playerIds) return _playerIds.Count; } }
     public string          Password       { get; set; } = string.Empty;
     /// <summary>Password spectators present (CreateGame SpectatorPassword). Empty = open to spectators.</summary>
     public string          SpectatorPassword { get; set; } = string.Empty;
@@ -43,10 +46,14 @@ public class MediusGame
     /// </summary>
     public int?            DmeWorldId     { get; set; }
 
-    private readonly List<int> _playerIds = new();
-    public IReadOnlyList<int> PlayerIds => _playerIds;
+    /// <summary>The host's EndGameReport, once the game has finished (null while it is running).</summary>
+    public GameResult?     Result         { get; set; }
 
-    public bool IsFull   => _playerIds.Count >= MaxPlayers;
+    private readonly List<int> _playerIds = new();
+    /// <summary>A copy of the roster (it changes from many connections at once).</summary>
+    public IReadOnlyList<int> PlayerIds { get { lock (_playerIds) return _playerIds.ToArray(); } }
+
+    public bool IsFull   => PlayerCount >= MaxPlayers;
     public bool IsLocked => !string.IsNullOrEmpty(Password);
     public bool IsSpectatorLocked => !string.IsNullOrEmpty(SpectatorPassword);
 

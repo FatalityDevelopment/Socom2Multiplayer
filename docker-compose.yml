@@ -13,6 +13,8 @@ services:
       # Optional: send consoles to someone else's DNAS server (IP or hostname) instead of the built-in one,
       # e.g. EXTERNAL_DNAS=dnas.example.org docker compose up. Empty = DNAS runs in this container.
       Online__ExternalDnasServer: "${EXTERNAL_DNAS:-}"
+      # DNAS region certificate / packet region: us-gw (default), eu-gw or gai-gw.
+      Online__DnasRegion: "${DNAS_REGION:-us-gw}"
     volumes:
       - socom2-data:/data          # accounts, stats, clans, DNAS tickets + packet logs, patch/APACHE00.ZDB
     ports:

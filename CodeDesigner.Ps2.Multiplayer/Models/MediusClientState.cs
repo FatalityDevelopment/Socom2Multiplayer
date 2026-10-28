@@ -83,7 +83,11 @@ public class MediusClientState
     public DateTime LastProactiveEchoAt { get; set; } = DateTime.MinValue;
 
     /// <summary>Incrementing SequenceId for the lobby anti-cheat SERVER_CHEAT_QUERY heartbeat.</summary>
-    public int CheatSeq { get; set; }
+    public int CheatSeq => Volatile.Read(ref _cheatSeq);
+    private int _cheatSeq;
+
+    /// <summary>Take the next CHEAT_QUERY sequence id. Atomic: the scanner, heartbeat and debug peeks share it.</summary>
+    public int NextCheatSeq() => Interlocked.Increment(ref _cheatSeq) - 1;
 
     // Lobby memory scanner (cheat-scan.json) — where this client's scan is up to.
     public int  ScanVersion    { get; set; } = -1;
@@ -103,6 +107,9 @@ public class MediusClientState
     // World placement
     // -------------------------------------------------------------------------
     public int? CurrentChannelId { get; set; }
+
+    /// <summary>Game-list filters this connection set (SetGameListFilter0), keyed by filter field.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<int, GameListFilter> GameListFilters { get; } = new();
     public int? CurrentGameId    { get; set; }
     public int? WorldId          { get; set; }
 

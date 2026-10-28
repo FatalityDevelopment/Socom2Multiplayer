@@ -4,7 +4,7 @@ namespace CodeDesigner.Ps2.Multiplayer.Storage
 {
     public interface IMultiplayerStorage
     {
-        MediusAccount CreateAccount(string name, string passwordHash);
+        MediusAccount? TryCreateAccount(string name, string passwordHash);
         MediusChannel CreateChannel(string name, int appId, int maxPlayers = 256);
         MediusGame CreateGame(string name, int appId, int hostAccountId, string hostName, int maxPlayers);
         MediusAccount? GetAccountById(int id);

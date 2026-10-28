@@ -21,13 +21,21 @@ param(
     [Parameter(Mandatory)] [string] $DnsNameLabel,   # unique within the region
     [string] $ResourceGroup = 'socom2-test-rg',
     [string] $Location      = 'eastus',
-    [string] $ImageTag      = $(git rev-parse --short HEAD),
-    [ValidateSet('Debug', 'Information', 'Warning')] [string] $LogLevel = 'Debug',
-    [string] $ExternalDnasServer = ''                # IP/hostname of another DNAS server; empty = built-in DnaSDK
+    [string] $ImageTag      = '',                    # empty = <commit>-<timestamp>, so every run deploys a new image
+    [ValidateSet('Debug', 'Information', 'Warning')] [string] $LogLevel = 'Information',
+    [string] $ExternalDnasServer = '',               # IP/hostname of another DNAS server; empty = built-in DnaSDK
+    [ValidateSet('us-gw', 'eu-gw', 'gai-gw')] [string] $DnasRegion = 'us-gw'
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot   = Resolve-Path (Join-Path $PSScriptRoot '../..')
+if (-not $ImageTag) {
+    # A tag per run: re-deploying the same tag (e.g. uncommitted changes on one commit) leaves the bicep
+    # parameters unchanged, and ACI then keeps running the old image.
+    $commit   = (git -C $repoRoot rev-parse --short HEAD 2>$null)
+    if (-not $commit) { $commit = 'local' }
+    $ImageTag = "$commit-$(Get-Date -Format 'yyyyMMddHHmmss')"
+}
 $projectDir = $repoRoot   # Dockerfile at the repo root builds the server + DnaSDK
 
 function Invoke-Az {
@@ -52,7 +60,7 @@ Write-Host "==> Deploying container group"
 $out = Invoke-Az deployment group create --resource-group $ResourceGroup `
     --template-file (Join-Path $PSScriptRoot 'main.bicep') `
     --parameters acrName=$AcrName dnsNameLabel=$DnsNameLabel imageTag=$ImageTag logLevel=$LogLevel `
-        externalDnasServer=$ExternalDnasServer `
+        externalDnasServer=$ExternalDnasServer dnasRegion=$DnasRegion `
     --query properties.outputs --output json | ConvertFrom-Json
 
 Write-Host ""

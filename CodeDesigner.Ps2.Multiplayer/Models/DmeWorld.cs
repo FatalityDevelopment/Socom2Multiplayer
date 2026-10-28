@@ -49,6 +49,12 @@ public class DmeWorld
     /// <summary>Destroy the world once its last client leaves (player-created games).</summary>
     public bool SelfDestructFlag { get; set; }
 
+    /// <summary>True once the world has been destroyed: it takes no new reservations.</summary>
+    public bool IsDestroyed { get; private set; }
+
+    /// <summary>Last time a slot was reserved or released; an empty world is swept a grace period after this.</summary>
+    public DateTime LastOccupancyChangeAt { get; private set; } = DateTime.UtcNow;
+
     /// <summary>Slots (reserved or connected) indexed by DME client index.</summary>
     public ConcurrentDictionary<int, DmeClientState> Clients { get; } = new();
 
@@ -97,36 +103,114 @@ public class DmeWorld
     /// </summary>
     public DmeClientState? Reserve(string sessionKey, int accountId, bool spectator = false)
     {
-        var existing = Clients.Values.FirstOrDefault(c => c.SessionKey == sessionKey && !c.Disconnected);
-        if (existing != null)
+        // One lock for the lookup and the allocation: two joins with the same session key must share a slot,
+        // and a world being destroyed must not hand out new ones.
+        lock (_slotLock)
         {
-            existing.IsSpectator = spectator;
-            return existing;
-        }
+            if (IsDestroyed) return null;
 
-        if (!TryAllocateSlot(out int index))
-            return null;
+            var existing = Clients.Values.FirstOrDefault(c => c.SessionKey == sessionKey && !c.Disconnected);
+            if (existing != null)
+            {
+                existing.IsSpectator = spectator;
+                return existing;
+            }
 
-        string token = Guid.NewGuid().ToString("N")[..16].ToUpperInvariant();
-        var client = new DmeClientState(sessionKey, token, accountId, this, index) { IsSpectator = spectator };
-        if (!Clients.TryAdd(index, client))
-        {
-            ReleaseSlot(index);
-            return null;
+            if (!TryAllocateSlot(out int index))
+                return null;
+
+            string token = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8));
+            var client = new DmeClientState(sessionKey, token, accountId, this, index) { IsSpectator = spectator };
+            if (!Clients.TryAdd(index, client))
+            {
+                ReleaseSlot(index);
+                return null;
+            }
+            LastOccupancyChangeAt = DateTime.UtcNow;
+            return client;
         }
-        return client;
     }
 
     /// <summary>Find a reserved slot by the access token presented in the DME connect.</summary>
     public DmeClientState? FindByAccessKey(string accessKey)
         => Clients.Values.FirstOrDefault(c => c.AccessKey == accessKey && !c.Disconnected);
 
+    /// <summary>
+    /// Claim the reserved slot for <paramref name="accessKey"/> for connection <paramref name="connectionId"/>.
+    /// Null when there is no such reservation or another connection already holds it.
+    /// </summary>
+    public DmeClientState? TryBind(string accessKey, string connectionId)
+    {
+        lock (_slotLock)
+        {
+            if (IsDestroyed) return null;
+            var slot = FindByAccessKey(accessKey);
+            if (slot == null || slot.IsConnected) return null;
+            slot.IsConnected       = true;
+            slot.BoundConnectionId = connectionId;
+            return slot;
+        }
+    }
+
     /// <summary>Remove a client and free its slot.</summary>
     public void RemoveClient(DmeClientState client)
     {
         client.MarkDisconnected();
-        if (Clients.TryRemove(client.DmeId, out _))
-            ReleaseSlot(client.DmeId);
+        lock (_slotLock)
+        {
+            // Only free the index if it still holds THIS client (a stale handle must not evict a newer one).
+            if (Clients.TryRemove(new KeyValuePair<int, DmeClientState>(client.DmeId, client)))
+                ReleaseSlot(client.DmeId);
+            LastOccupancyChangeAt = DateTime.UtcNow;
+        }
+    }
+
+    /// <summary>Destroy the world if nobody holds a slot in it (fake clients included). True when it was destroyed.</summary>
+    public bool TryDestroyIfEmpty()
+    {
+        lock (_slotLock)
+        {
+            if (IsDestroyed) return true;
+            if (!Clients.IsEmpty || _fakeIds.Count > 0) return false;
+            DestroyLocked();
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Housekeeping for every world: drop reservations nobody connected to within <paramref name="reservationTtl"/>,
+    /// then destroy self-destructing worlds that have been empty for <paramref name="emptyGrace"/>. Without this a
+    /// game whose host never reached the DME (or a failed join) kept its world, and its game-list row, forever —
+    /// and world ids run out at 255. Returns the worlds destroyed.
+    /// </summary>
+    public static List<DmeWorld> Sweep(TimeSpan reservationTtl, TimeSpan emptyGrace)
+    {
+        var destroyed = new List<DmeWorld>();
+        var now = DateTime.UtcNow;
+        foreach (var world in _idToWorld.Values)
+        {
+            lock (world._slotLock)
+            {
+                foreach (var slot in world.Clients.Values)
+                    if (!slot.IsConnected && now - slot.ReservedAt > reservationTtl)
+                        world.RemoveClient(slot);
+
+                if (world.SelfDestructFlag && world.Clients.IsEmpty && world._fakeIds.Count == 0
+                    && DateTime.UtcNow - world.LastOccupancyChangeAt >= emptyGrace)
+                {
+                    world.DestroyLocked();
+                    destroyed.Add(world);
+                }
+            }
+        }
+        return destroyed;
+    }
+
+    /// <summary>Forget every world (server shutdown).</summary>
+    public static void DestroyAll()
+    {
+        foreach (var world in _idToWorld.Values)
+            world.Destroy();
     }
 
     /// <summary>Number of clients with a live DME connection (players and spectators).</summary>
@@ -222,6 +306,7 @@ public class DmeWorld
         lock (_slotLock)
         {
             if (!_fakeIds.Remove(index)) return false;
+            LastOccupancyChangeAt = DateTime.UtcNow;
             _slotUsed[index] = false;
             return true;
         }
@@ -275,7 +360,16 @@ public class DmeWorld
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    public void Destroy() => _idToWorld.TryRemove(WorldId, out _);
+    public void Destroy()
+    {
+        lock (_slotLock) DestroyLocked();
+    }
+
+    private void DestroyLocked()
+    {
+        IsDestroyed = true;
+        _idToWorld.TryRemove(new KeyValuePair<int, DmeWorld>(WorldId, this));
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -285,6 +379,8 @@ public class DmeWorld
     /// </summary>
     private static void Forward(DmeClientState target, int sourceDmeId, byte[] payload)
     {
+        // The 2-byte source prefix must still fit the frame's 16-bit length.
+        if (payload.Length + 2 > ScertPacket.MaxPayloadLength) return;
         var body = new byte[2 + payload.Length];
         body[0] = (byte)sourceDmeId;
         body[1] = (byte)(sourceDmeId >> 8);

@@ -1,6 +1,12 @@
 [README(1).md](https://github.com/user-attachments/files/33941024/README.1.md)
 # DnaSDK — PlayStation 2 DNAS Development Kit
 
+> **In this repository** this is DnaSDK's upstream README, kept for its protocol documentation. The DnaSDK sources
+> are compiled into the multiplayer server, so the standalone parts below (its `Program.cs`, the `DnaSDK.exe`
+> command-line options and the "Setup and running" section) don't apply here. The server starts the gateway itself
+> (`Servers/DnasServer.cs`); configure it with the `Dnas*` settings in the top-level README. Tickets are cached under
+> `<DataDirectory>/dnas/RSA/Signatures`, not `RSA/Signatures`.
+
 A reconstructed development kit for the original PlayStation 2 Dynamic Network Authentication System (DNAS), providing protocol handling, cryptography, client/server authentication, and SSL/TLS communication for authentic, dynamically generated DNAS sessions.
 
 This presents DnaSDK as an actual development kit, rather than simply a reverse-engineering research project.

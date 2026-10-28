@@ -67,6 +67,8 @@ public class DnasServer
             var authority = File.Exists(tls.CaCer) ? TlsCredentials.LoadPublicCertificatePem(tls.CaCer!) : null;
             if (authority == null)
                 _log.LogWarning("[DNAS] No CA certificate at {Path} — the PS2 rejects a leaf-only chain", tls.CaCer);
+            WarnIfExpired("certificate", tls.CertPem, certificate);
+            if (authority != null) WarnIfExpired("CA certificate", tls.CaCer, authority);
 
             var server = new TcpServer(IPAddress.Parse(_config.BindAddress), _config.DnasHttpsPort,
                 new DnasServerProcessor(sessions), certificate, privateKey, authority, captureDir);
@@ -108,11 +110,27 @@ public class DnasServer
         }
     }
 
+    /// <summary>
+    /// The console checks the gateway chain against its own clock, so an expired certificate can make every DNAS
+    /// login fail. The server still starts (consoles with an old clock accept it); this only says why logins might break.
+    /// </summary>
+    private void WarnIfExpired(string what, string? path, System.Security.Cryptography.X509Certificates.X509Certificate2 cert)
+    {
+        if (cert.NotAfter < DateTime.Now)
+            _log.LogWarning("[DNAS] The {What} {Path} expired on {Date:yyyy-MM-dd}. Consoles whose clock is past that date " +
+                            "may reject DNAS; set DnasCertPath/DnasKeyPath/DnasCaPath to a current chain.", what, path, cert.NotAfter);
+        else if (cert.NotAfter < DateTime.Now.AddDays(30))
+            _log.LogWarning("[DNAS] The {What} {Path} expires on {Date:yyyy-MM-dd}", what, path, cert.NotAfter);
+    }
+
     /// <summary>Same lookup order as the original DNAS server: configured paths, dnas.crt/.key, then the region cert.</summary>
     private TlsServerSettings ResolveCertificates()
     {
         string certPath = ResolvePath(_config.DnasCertPath, "Certificates", "dnas.crt");
         string keyPath  = ResolvePath(_config.DnasKeyPath,  "Certificates", "dnas.key");
+        if (!string.IsNullOrWhiteSpace(_config.DnasCertPath) && string.IsNullOrWhiteSpace(_config.DnasKeyPath))
+            _log.LogWarning("[DNAS] DnasCertPath is set but DnasKeyPath isn't — using {Key}; set DnasKeyPath to the key " +
+                            "that matches your certificate", keyPath);
 
         // Fallback: the community certs matching the configured region
         if (!File.Exists(certPath))

@@ -52,7 +52,7 @@ public partial class MlsServer
         for (int off = 0; off < length; off += MaxPeekChunk)
         {
             int n = Math.Min(MaxPeekChunk, length - off);
-            int seq = c.State.CheatSeq++;
+            int seq = c.State.NextCheatSeq();
             var waiter = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
             PendingPeeks[(connectionId, seq)] = waiter;
             try
@@ -128,12 +128,13 @@ public partial class MlsServer
             var players = online.Where(p => p.State.LobbyWorldId == room.ChannelId).ToList();
             sb.AppendLine($"room 0x{room.ChannelId:X} {room.ChannelName}: {players.Count}/{room.MaxPlayers} players");
             foreach (var p in players.OrderBy(p => _store.GetAccountById(p.AccountId)?.AccountName)) sb.AppendLine(Player(p));
-            foreach (var g in _store.GetGames(room.AppId).Where(g => g.LobbyChannelId == room.ChannelId))
+            foreach (var g in _store.AllGames.Where(g => g.LobbyChannelId == room.ChannelId && g.Status != GameWorldStatus.WorldInactive))
             {
                 var w = g.DmeWorldId is int wid ? DmeWorld.GetById(wid) : null;
                 sb.AppendLine($"    game 0x{g.GameId:X} '{g.GameName}' host {g.HostName}: {w?.ConnectedCount ?? g.PlayerCount}/{g.MaxPlayers}" +
                               (w is { SpectatorCount: > 0 } ? $" ({w.SpectatorCount} spectating)" : "") + (g.IsLocked ? " [password]" : "") +
-                              (g.IsSpectatorLocked ? " [spectator password]" : ""));
+                              (g.IsSpectatorLocked ? " [spectator password]" : "") +
+                              (g.Result is { } res ? $" [ended: team '{res.WinningTeam}', player '{res.WinningPlayer}', score {res.FinalScore}]" : ""));
             }
             foreach (var kv in _defaultGameWorlds.Where(kv => kv.Key >> 8 == room.ChannelId && DmeWorld.GetById(kv.Value.WorldId) == kv.Value && kv.Value.ConnectedCount > 0))
             {
@@ -163,7 +164,10 @@ public partial class MlsServer
               ?? (TryParseAddr(room, out uint id) ? rooms.FirstOrDefault(r => r.ChannelId == (int)id) : null);
         if (target == null) throw new ArgumentException($"no briefing room '{room}'; rooms: {string.Join(", ", rooms.Select(r => $"0x{r.ChannelId:X} {r.ChannelName}"))}");
 
-        var account = _store.GetAccountByName(name.Trim()) ?? _store.CreateAccount(name.Trim(), string.Empty);
+        var account = _store.GetOrCreateAccount(name.Trim(), string.Empty, out _);
+        // A password means a real player owns the name; a virtual player would hijack its presence.
+        if (account.PasswordHash.Length > 0)
+            throw new ArgumentException($"'{account.AccountName}' is a real player's account");
         if (_presence.IsOnline(account.AccountId) && !_presence.IsVirtual(account.AccountId))
             throw new ArgumentException($"'{account.AccountName}' is a real online player");
         _presence.AddVirtual(account.AccountId, target.ChannelId, target.ChannelName);

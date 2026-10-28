@@ -68,8 +68,14 @@ public partial class MlsServer
         int accountId = Int(p, SessionBody), minutes = Int(p, SessionBody + 4), worldId = Int(p, SessionBody + 8);
         if (worldId <= 0) worldId = state.CurrentGameId ?? 0;
         if (minutes <= 0) minutes = 120;
+        minutes = Math.Min(minutes, 60 * 24 * 365);   // AddMinutes(int.MaxValue) would throw
 
-        var status = accountId > 0 && worldId > 0 ? MediusCallbackStatus.MediusSuccess : MediusCallbackStatus.MediusInvalidRequestMsg;
+        // The voted-out console bans itself; otherwise only the game's host may ban someone from it.
+        bool allowed = state.AccountId is int sender
+                       && (sender == accountId || _store.GetGameById(worldId)?.HostAccountId == sender);
+        var status = accountId <= 0 || worldId <= 0 ? MediusCallbackStatus.MediusInvalidRequestMsg
+                   : !allowed                       ? MediusCallbackStatus.MediusFail
+                   : MediusCallbackStatus.MediusSuccess;
         if (status == MediusCallbackStatus.MediusSuccess)
             _gameBans.GetOrAdd(worldId, _ => new())[accountId] = DateTime.UtcNow.AddMinutes(minutes);
 
@@ -95,24 +101,50 @@ public partial class MlsServer
         var type = (MediusChatMessageType)Int(p, SessionBody);
         int targetId = Int(p, SessionBody + 4);
         string text = Str(p, SessionBody + 8, ChatLen);
+        await ForwardChatAsync(state, type, targetId, text, ct);
+    }
+
+    /// <summary>
+    /// GenericChatMessage (LobbyExt): the same SessionKey | pad2 | MessageType @40 | TargetID @44 | Text @48 request
+    /// with a longer text field. It used to be logged and dropped; it is now delivered like ChatMessage, as a
+    /// ChatFwdMessage (the forward this client is proven to display), so its text is cut to 64 characters.
+    /// </summary>
+    private Task HandleGenericChatAsync(MediusPacket packet, MediusClientState state, CancellationToken ct)
+    {
+        const int GenericChatLen = 512;
+        var p = packet.Payload;
+        var type = (MediusChatMessageType)Int(p, SessionBody);
+        int targetId = Int(p, SessionBody + 4);
+        string text = Str(p, SessionBody + 8, GenericChatLen);
+        return ForwardChatAsync(state, type, targetId, text.Length > ChatLen - 1 ? text[..(ChatLen - 1)] : text, ct);
+    }
+
+    /// <summary>Deliver one chat line from the sender to its recipients as ChatFwdMessage (no reply to the sender).</summary>
+    private async Task ForwardChatAsync(MediusClientState state, MediusChatMessageType type, int targetId, string text, CancellationToken ct)
+    {
         var me = Me(state);
         if (me == null) return;
 
-        HashSet<int>? accounts = type switch
+        // Clan, buddy and ignore lists change under _store.Sync; read them under it too.
+        List<(MediusClientState State, TcpClient Client)> recipients;
+        lock (_store.Sync)
         {
-            MediusChatMessageType.Whisper                       => new HashSet<int> { targetId },
-            MediusChatMessageType.MediusClanChatType            => _store.GetClanById(me.ClanId)?.Members.ToHashSet() ?? new HashSet<int>(),
-            MediusChatMessageType.MediusBuddyChatType           => me.Buddies.ToHashSet(),
-            _                                                   => null,   // broadcast: by lobby world, below
-        };
+            HashSet<int>? accounts = type switch
+            {
+                MediusChatMessageType.Whisper                       => new HashSet<int> { targetId },
+                MediusChatMessageType.MediusClanChatType            => _store.GetClanById(me.ClanId)?.Members.ToHashSet() ?? new HashSet<int>(),
+                MediusChatMessageType.MediusBuddyChatType           => me.Buddies.ToHashSet(),
+                _                                                   => null,   // broadcast: by lobby world, below
+            };
 
-        var recipients = Clients.Values.Where(c =>
-            c.State.ConnectionId != state.ConnectionId
-            && c.State.IsSessionEstablished
-            && c.State.AccountId is int id && id != me.AccountId
-            && (type == MediusChatMessageType.BroadcastAcrossEntireUniverse
-                || (accounts != null ? accounts.Contains(id) : c.State.WorldId == state.WorldId))
-            && _store.GetAccountById(id)?.Ignores.Contains(me.AccountId) != true).ToList();
+            recipients = Clients.Values.Where(c =>
+                c.State.ConnectionId != state.ConnectionId
+                && c.State.IsSessionEstablished
+                && c.State.AccountId is int id && id != me.AccountId
+                && (type == MediusChatMessageType.BroadcastAcrossEntireUniverse
+                    || (accounts != null ? accounts.Contains(id) : c.State.WorldId == state.WorldId))
+                && _store.GetAccountById(id)?.Ignores.Contains(me.AccountId) != true).ToList();
+        }
 
         var fwd = new MediusWriter();
         fwd.WritePadding(MediusConstants.MESSAGEID_MAXLEN);   // MessageID (unsolicited)

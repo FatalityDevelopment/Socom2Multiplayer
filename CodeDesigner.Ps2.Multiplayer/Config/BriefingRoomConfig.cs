@@ -18,6 +18,9 @@ public class BriefingRoomConfig
     /// <summary>SecurityLevel (wire 0x24). 0 on every retail room.</summary>
     public int SecurityLevel { get; set; }
 
+    /// <summary>Password JoinChannel must present. Empty = open (whatever <see cref="SecurityLevel"/> shows).</summary>
+    public string Password { get; set; } = string.Empty;
+
     /// <summary>
     /// Packed room attributes (wire 0x28). byte0 = rank bitmask (1 Ensign, 2 Lieutenant, 4 Lt Commander,
     /// 8 Captain; 0 = open to all) — the client tests it with <c>&amp; 0xF</c>; byte3 = display order.

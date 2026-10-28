@@ -23,6 +23,11 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
     private readonly Timer? _saveTimer;
     private int _dirty;
 
+    /// <summary>Debounce for snapshot writes, and the longest a change may wait under constant activity.</summary>
+    private static readonly TimeSpan SaveDebounce = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan MaxSaveDelay = TimeSpan.FromSeconds(30);
+    private long _firstDirtyTicks;   // when the pending (unsaved) changes started; 0 = nothing pending
+
     /// <summary>Lock for multi-step social/clan mutations (friends, ignores, clan membership, invitations).</summary>
     public object Sync { get; } = new();
 
@@ -55,18 +60,36 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
     public MediusAccount? GetAccountByName(string name) =>
         _accountsByName.TryGetValue(name, out var a) ? a : null;
 
-    public MediusAccount CreateAccount(string name, string passwordHash)
+    private readonly object _accountCreateLock = new();
+
+    /// <summary>
+    /// Create an account named <paramref name="name"/>, or return null when the name is taken. Checking and
+    /// creating happen under one lock, so two logins racing on a new name can't both create it.
+    /// </summary>
+    public MediusAccount? TryCreateAccount(string name, string passwordHash)
     {
-        var account = new MediusAccount
+        lock (_accountCreateLock)
         {
-            AccountId = Interlocked.Increment(ref _nextAccountId),
-            AccountName = name,
-            PasswordHash = passwordHash,
-        };
-        _accountsById[account.AccountId] = account;
-        _accountsByName[account.AccountName] = account;
-        MarkDirty();
-        return account;
+            if (_accountsByName.ContainsKey(name)) return null;
+            var account = new MediusAccount
+            {
+                AccountId = Interlocked.Increment(ref _nextAccountId),
+                AccountName = name,
+                PasswordHash = passwordHash,
+            };
+            _accountsById[account.AccountId] = account;
+            _accountsByName[account.AccountName] = account;
+            MarkDirty();
+            return account;
+        }
+    }
+
+    /// <summary>The account named <paramref name="name"/>, creating it (with <paramref name="passwordHash"/>) if missing.</summary>
+    public MediusAccount GetOrCreateAccount(string name, string passwordHash, out bool created)
+    {
+        var account = TryCreateAccount(name, passwordHash);
+        created = account != null;
+        return account ?? GetAccountByName(name)!;
     }
 
     // -------------------------------------------------------------------------
@@ -74,10 +97,29 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
     // -------------------------------------------------------------------------
     private readonly ConcurrentDictionary<string, int> _accountBySession = new(StringComparer.OrdinalIgnoreCase);
 
-    public void RegisterSession(string sessionKey, int accountId)
+    /// <summary>
+    /// Map <paramref name="sessionKey"/> to the account. A fresh login (<paramref name="replaceOthers"/>) also drops
+    /// the account's older keys, so keys from earlier sessions stop working and the table stays one key per login.
+    /// </summary>
+    public void RegisterSession(string sessionKey, int accountId, bool replaceOthers = false)
     {
-        if (!string.IsNullOrEmpty(sessionKey)) _accountBySession[sessionKey] = accountId;
+        if (string.IsNullOrEmpty(sessionKey)) return;
+        if (replaceOthers)
+            foreach (var (key, id) in _accountBySession)
+                if (id == accountId && !key.Equals(sessionKey, StringComparison.OrdinalIgnoreCase))
+                    _accountBySession.TryRemove(new KeyValuePair<string, int>(key, id));
+        _accountBySession[sessionKey] = accountId;
     }
+
+    /// <summary>Forget a session key (logout, or the connection that owned it closed).</summary>
+    public void RevokeSession(string? sessionKey)
+    {
+        if (!string.IsNullOrEmpty(sessionKey)) _accountBySession.TryRemove(sessionKey, out _);
+    }
+
+    /// <summary>True when <paramref name="sessionKey"/> is registered to <paramref name="accountId"/>.</summary>
+    public bool IsSessionOf(string? sessionKey, int accountId) =>
+        !string.IsNullOrEmpty(sessionKey) && _accountBySession.TryGetValue(sessionKey, out var id) && id == accountId;
 
     public MediusAccount? GetAccountBySession(string? sessionKey) =>
         !string.IsNullOrEmpty(sessionKey) && _accountBySession.TryGetValue(sessionKey, out var id) ? GetAccountById(id) : null;
@@ -205,6 +247,9 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
     public IEnumerable<MediusGame> GetGames(int appId) =>
         _gamesById.Values.Where(g => g.AppId == appId && g.Status != GameWorldStatus.WorldInactive);
 
+    /// <summary>Every game, including ones whose host reported them inactive (housekeeping).</summary>
+    public IEnumerable<MediusGame> AllGames => _gamesById.Values;
+
     public MediusGame? GetGameById(int id) =>
         _gamesById.TryGetValue(id, out var g) ? g : null;
 
@@ -241,12 +286,20 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
         public List<MediusClanInvitation> Invitations { get; set; } = new();
     }
 
-    /// <summary>Schedule a snapshot write (debounced — many changes in a burst cost one write).</summary>
+    /// <summary>
+    /// Schedule a snapshot write (debounced — many changes in a burst cost one write). Under constant activity the
+    /// debounce would keep moving, so a write is forced once changes have waited <see cref="MaxSaveDelay"/>.
+    /// </summary>
     public void MarkDirty()
     {
         if (_saveTimer == null) return;
         Interlocked.Exchange(ref _dirty, 1);
-        _saveTimer.Change(TimeSpan.FromSeconds(2), Timeout.InfiniteTimeSpan);
+        long now = DateTime.UtcNow.Ticks;
+        Interlocked.CompareExchange(ref _firstDirtyTicks, now, 0);
+        var waited = TimeSpan.FromTicks(now - Interlocked.Read(ref _firstDirtyTicks));
+        var delay  = waited >= MaxSaveDelay ? TimeSpan.Zero : SaveDebounce;
+        try { _saveTimer.Change(delay, Timeout.InfiniteTimeSpan); }
+        catch (ObjectDisposedException) { /* shutting down: Dispose writes the snapshot */ }
     }
 
     /// <summary>Write the snapshot now if anything changed.</summary>
@@ -255,11 +308,13 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
     private void SaveIfDirty()
     {
         if (_snapshotPath == null || Interlocked.Exchange(ref _dirty, 0) == 0) return;
+        Interlocked.Exchange(ref _firstDirtyTicks, 0);
         try
         {
             string json;
             lock (Sync)
             {
+                // Serialized while holding Sync: the friend/ignore/clan lists only change under it.
                 json = JsonSerializer.Serialize(new Snapshot
                 {
                     NextAccountId     = Volatile.Read(ref _nextAccountId),
@@ -271,21 +326,26 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
                     Invitations       = _invitationsById.Values.OrderBy(i => i.InvitationId).ToList(),
                 }, JsonOptions);
             }
-            var tmp = _snapshotPath + ".tmp";
-            File.WriteAllText(tmp, json);
-            File.Move(tmp, _snapshotPath, overwrite: true);   // atomic replace — never a half-written file
+            // Keep the previous good snapshot as .bak: Load falls back to it if the main file is ever unreadable.
+            if (File.Exists(_snapshotPath))
+                File.Copy(_snapshotPath, _snapshotPath + ".bak", overwrite: true);
+            AtomicFile.WriteAllText(_snapshotPath, json);
         }
         catch (Exception ex)
         {
+            _log?.LogError(ex, "[Store] Saving {Path} failed — retrying", _snapshotPath);
+            // Re-arm (slowly), or the changes would wait for the next unrelated write.
             Interlocked.Exchange(ref _dirty, 1);
-            _log?.LogError(ex, "[Store] Saving {Path} failed", _snapshotPath);
+            try { _saveTimer?.Change(MaxSaveDelay, Timeout.InfiniteTimeSpan); }
+            catch (ObjectDisposedException) { /* shutting down */ }
         }
     }
 
     private void Load()
     {
-        if (_snapshotPath == null || !File.Exists(_snapshotPath)) return;
-        var snap = JsonSerializer.Deserialize<Snapshot>(File.ReadAllText(_snapshotPath), JsonOptions) ?? new Snapshot();
+        if (_snapshotPath == null) return;
+        var snap = ReadSnapshot(_snapshotPath) ?? ReadSnapshot(_snapshotPath + ".bak");
+        if (snap == null) return;
 
         foreach (var a in snap.Accounts)
         {
@@ -303,6 +363,27 @@ public class InMemoryStorage : IMultiplayerStorage, IDisposable
 
         _log?.LogInformation("[Store] Loaded {Accounts} accounts, {Clans} clans from {Path}",
             _accountsById.Count, _clansById.Count, _snapshotPath);
+    }
+
+    /// <summary>Read one snapshot file; null if it is missing or unreadable (logged).</summary>
+    private Snapshot? ReadSnapshot(string path)
+    {
+        if (!File.Exists(path)) return null;
+        try
+        {
+            var snap = JsonSerializer.Deserialize<Snapshot>(File.ReadAllText(path), JsonOptions);
+            if (snap != null && path.EndsWith(".bak", StringComparison.Ordinal))
+                _log?.LogWarning("[Store] Main snapshot unreadable — restored from {Path}", path);
+            return snap;
+        }
+        catch (Exception ex) when (ex is JsonException or IOException or NotSupportedException)
+        {
+            _log?.LogError("[Store] {Path} is unreadable: {Msg}", path, ex.Message);
+            // Keep the bad file for inspection; the next save would overwrite it.
+            try { File.Copy(path, path + ".corrupt-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss"), overwrite: true); }
+            catch (IOException) { /* best effort */ }
+            return null;
+        }
     }
 
     public void Dispose()

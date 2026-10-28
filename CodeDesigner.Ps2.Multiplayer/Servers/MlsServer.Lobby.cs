@@ -31,13 +31,15 @@ public partial class MlsServer
     /// <summary>
     /// ClearGameListFilter0 (0x50, 44 B): SessionKey | pad2 | FilterID @0x28 (SOCOM uses 1 and 0x0A). Reply
     /// ClearGameListFilterResponse (0x51) = header only; the client's callbacks read nothing but StatusCode and
-    /// go on to SetGameListFilter0 → GameList_ExtraInfo0. Filters themselves are never applied here (the room's
-    /// full list is always sent), so the ack is all that is needed. Gated like SetGameListFilter0: a briefing-room
+    /// go on to SetGameListFilter0 → GameList_ExtraInfo0. The filter for that field is dropped; filters are only
+    /// applied to the list when ApplyGameListFilters is on. Gated like SetGameListFilter0: a briefing-room
     /// connection is always answered, the community/login connection only with CommunityRetailReplies.
     /// </summary>
     private Task HandleClearGameListFilterAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
         int filterId = Int(packet.Payload, SessionBody);
+        // SOCOM sends 1 and 0x0A here: filter-field numbers (player count, lobby world). Drop that field's filter.
+        state.GameListFilters.TryRemove(filterId, out _);
         if (IsRoomConnection(state) || _config.CommunityRetailReplies)
         {
             _log.LogDebug("[MLS] ClearGameListFilter0 filter={Filter} (world 0x{World:X}) -> ack", filterId, state.WorldId ?? 0);
@@ -78,12 +80,13 @@ public partial class MlsServer
     /// pad3. The client reads StatusCode @0x18 and MediusWorldID @0x44 (callbacks EE 0x0030A980 / 0x0030B1D0).
     /// </summary>
     internal static byte[] BuildFindWorldByNameResponse(MediusPacket packet, MediusCallbackStatus status, int appId,
-        int worldId, string worldName, int worldStatus, int playerCount, int maxPlayers, int gameWorldCount)
+        int worldId, string worldName, int worldStatus, int playerCount, int maxPlayers, int gameWorldCount,
+        string appName = "SOCOM II")
     {
         var w = new MediusWriter();
         WriteMlsHeader(w, packet, status);                                   // 0x00 .. 0x1C
         w.Write(appId);                                                       // 0x1C ApplicationID
-        w.WriteString(status == MediusCallbackStatus.MediusSuccess ? "SOCOM II" : "", MediusConstants.APPNAME_MAXLEN); // 0x20
+        w.WriteString(status == MediusCallbackStatus.MediusSuccess ? appName : "", MediusConstants.APPNAME_MAXLEN); // 0x20
         w.Write(0);                                                           // 0x40 ApplicationType (game)
         w.Write(worldId);                                                     // 0x44 MediusWorldID
         w.WriteString(worldName, WorldNameLen);                               // 0x48 WorldName[64]
@@ -108,7 +111,7 @@ public partial class MlsServer
             body = room == null
                 ? BuildFindWorldByNameResponse(packet, MediusCallbackStatus.MediusChannelNotFound, 0, 0, "", 0, 0, 0, 0)
                 : BuildFindWorldByNameResponse(packet, MediusCallbackStatus.MediusSuccess, state.AppId, room.ChannelId, room.ChannelName,
-                    (int)MediusWorldStatus.WorldActive, RoomPlayerCount(room.ChannelId), room.MaxPlayers, GamesInRoom(room.ChannelId, state.AppId));
+                    (int)MediusWorldStatus.WorldActive, RoomPlayerCount(room.ChannelId), room.MaxPlayers, GamesInRoom(room.ChannelId, state.AppId), appName: _config.ApplicationName);
             _log.LogInformation("[MLS] FindWorldByName lobby '{Name}' -> {Result}", name, room != null ? $"0x{room.ChannelId:X}" : "not found");
         }
         else
@@ -117,7 +120,7 @@ public partial class MlsServer
             body = found == null
                 ? BuildFindWorldByNameResponse(packet, MediusCallbackStatus.MediusGameNotFound, 0, 0, "", 0, 0, 0, 0)
                 : BuildFindWorldByNameResponse(packet, MediusCallbackStatus.MediusSuccess, state.AppId, found.Value.WorldId, found.Value.Name,
-                    found.Value.WorldStatus, found.Value.PlayerCount, found.Value.MaxPlayers, 0);
+                    found.Value.WorldStatus, found.Value.PlayerCount, found.Value.MaxPlayers, 0, appName: _config.ApplicationName);
             _log.LogInformation("[MLS] FindWorldByName game '{Name}' -> {Result}", name, found != null ? $"0x{found.Value.WorldId:X}" : "not found");
         }
 
@@ -224,9 +227,10 @@ public partial class MlsServer
     /// <summary>
     /// AddToBuddyListConfirmation (LobbyExt 0x05, 48 B): SessionKey | pad2 | TargetAccountID @0x28 | 0 @0x2C. SOCOM II
     /// sends it after a FindPlayer-by-name (callback EE 0x0031E960 copies FindPlayerResponse.AccountID @0x48 into it)
-    /// when the player types a friend's name. Retail forwarded the request to the target for confirmation; this
-    /// private server accepts on their behalf and makes the friendship mutual, then answers RequestAccepted so the
-    /// client refreshes its buddy list straight away.
+    /// when the player types a friend's name. Retail forwarded the request to the target for confirmation. Here the
+    /// target goes on the requester's list straight away (answered RequestAccepted so the client refreshes it), and the
+    /// requester waits in the target's buddy invitations (GetBuddyInvitations) until the target adds them back.
+    /// Nobody is put on another player's list without that player's say.
     /// </summary>
     private Task HandleAddToBuddyListConfirmationAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
@@ -241,17 +245,67 @@ public partial class MlsServer
                 status = MediusCallbackStatus.MediusAccountNotFound;
             else
             {
-                if (!me.Buddies.Contains(target.AccountId)) me.Buddies.Add(target.AccountId);
-                if (!target.Buddies.Contains(me.AccountId)) target.Buddies.Add(me.AccountId);
-                _store.MarkDirty();
+                AddBuddyLocked(me, target);
                 status = MediusCallbackStatus.MediusRequestAccepted;
             }
         }
 
-        _log.LogInformation("[MLS] AddToBuddyListConfirmation {Target} ({Id}) by {Me} -> {Status} (auto-accepted, mutual)",
+        _log.LogInformation("[MLS] AddToBuddyListConfirmation {Target} ({Id}) by {Me} -> {Status}",
             target?.AccountName ?? "?", targetId, me?.AccountName, status);
         var body = BuildAddToBuddyListConfirmationResponse(packet, status, target?.AccountId ?? 0, target?.AccountName ?? "");
         return SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.AddToBuddyListConfirmationResponse, body), state, ct);
+    }
+
+    /// <summary>
+    /// <paramref name="me"/> adds <paramref name="target"/>: target joins my list. If the target already asked for me,
+    /// that answers their request; otherwise mine waits in their invitations. Caller holds <c>_store.Sync</c>.
+    /// </summary>
+    private void AddBuddyLocked(MediusAccount me, MediusAccount target)
+    {
+        if (!me.Buddies.Contains(target.AccountId)) me.Buddies.Add(target.AccountId);
+        me.BuddyRequestsFrom.Remove(target.AccountId);
+        if (!target.Buddies.Contains(me.AccountId) && !target.BuddyRequestsFrom.Contains(me.AccountId))
+            target.BuddyRequestsFrom.Add(me.AccountId);
+        _store.MarkDirty();
+    }
+
+    /// <summary>
+    /// GetBuddyInvitations (LobbyExt, MessageID only) → GetBuddyInvitationsResponse rows (74 B, the retail size):
+    /// header | AccountID | AccountName[32] | AddType @0x40 | EndOfList @0x44 | pad3. One row per player who added
+    /// this one and is still waiting to be added back; none = a single NoResult row with EndOfList = 1.
+    /// </summary>
+    private async Task HandleGetBuddyInvitationsAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
+    {
+        const int AddSymmetric = 1;
+        var me = Me(state);
+        var from = me == null ? new List<MediusAccount>()
+            : Snapshot(me.BuddyRequestsFrom).Select(_store.GetAccountById).OfType<MediusAccount>().ToList();
+
+        if (from.Count == 0)
+        {
+            var w = new MediusWriter();
+            WriteMlsHeader(w, packet, MediusCallbackStatus.MediusNoResult);
+            w.Write(0);                                          // AccountID
+            w.WriteString("", MediusConstants.ACCOUNTNAME_MAXLEN); // AccountName[32]
+            w.Write(0);                                          // AddType
+            w.Write((byte)1);                                    // EndOfList
+            w.WritePadding(3);
+            await SendMediusAsync(tcp, MediusPacket.BuildLobbyExt(MediusLobbyExtMessageId.GetBuddyInvitationsResponse, w.ToArray()), state, ct);
+            return;
+        }
+
+        for (int i = 0; i < from.Count; i++)
+        {
+            var w = new MediusWriter();
+            WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+            w.Write(from[i].AccountId);
+            w.WriteString(from[i].AccountName, MediusConstants.ACCOUNTNAME_MAXLEN);
+            w.Write(AddSymmetric);
+            w.Write((byte)(i == from.Count - 1 ? 1 : 0));
+            w.WritePadding(3);
+            await SendMediusAsync(tcp, MediusPacket.BuildLobbyExt(MediusLobbyExtMessageId.GetBuddyInvitationsResponse, w.ToArray()), state, ct);
+        }
+        _log.LogInformation("[MLS] GetBuddyInvitations for {Me} -> {Count}", me?.AccountName, from.Count);
     }
 
     // =========================================================================
@@ -260,7 +314,9 @@ public partial class MlsServer
 
     /// <summary>
     /// AddPlayerToClan (0x5E, 244 B): SessionKey | pad2 | AccountID @0x28 | Message[200] @0x2C ("Everyone welcome %s to the
-    /// clan", EE 0x00303EF0). Leader only; the player must not be in a clan. The message is posted on the clan board.
+    /// clan", EE 0x00303EF0). Leader only; the player must not be in a clan. A player who already accepted (or has an
+    /// open) invitation from this clan joins and the message is posted on the clan board; anyone else gets an
+    /// invitation to accept (CheckMyClanInvitations / RespondToClanInvitation) instead of being added unasked.
     /// Reply AddPlayerToClanResponse (0x5F) = header only (the callback, EE 0x00304220, checks StatusCode).
     /// </summary>
     private Task HandleAddPlayerToClanAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
@@ -271,6 +327,7 @@ public partial class MlsServer
         var me = Me(state);
         var target = _store.GetAccountById(targetId);
         MediusCallbackStatus status;
+        bool invited = false;
 
         lock (_store.Sync)
         {
@@ -281,19 +338,29 @@ public partial class MlsServer
             else if (_store.GetClanById(target.ClanId) != null) status = MediusCallbackStatus.MediusInvalidRequestMsg;   // already in a clan (same as the invite path)
             else
             {
-                if (!clan.Members.Contains(target.AccountId)) clan.Members.Add(target.AccountId);
-                target.ClanId = clan.ClanId;
-                foreach (var inv in _store.Invitations.Where(i => i.ClanId == clan.ClanId && i.AccountId == target.AccountId
-                             && i.Status == MediusClanInvitationsResponseStatus.ClanInvitationUndecided))
-                    inv.Status = MediusClanInvitationsResponseStatus.ClanInvitationAccept;
-                if (message.Trim().Length > 0)
-                    clan.Messages.Add(new MediusClanMessage { MessageId = _store.NextClanMessageId(), Text = message });
+                var invitations = _store.Invitations.Where(i => i.ClanId == clan.ClanId && i.AccountId == target.AccountId
+                    && i.Status is MediusClanInvitationsResponseStatus.ClanInvitationUndecided
+                                or MediusClanInvitationsResponseStatus.ClanInvitationAccept).ToList();
+                if (invitations.Count == 0)
+                {
+                    _store.CreateInvitation(clan.ClanId, target.AccountId, message);
+                    invited = true;
+                }
+                else
+                {
+                    if (!clan.Members.Contains(target.AccountId)) clan.Members.Add(target.AccountId);
+                    target.ClanId = clan.ClanId;
+                    foreach (var inv in invitations) inv.Status = MediusClanInvitationsResponseStatus.ClanInvitationAccept;
+                    if (message.Trim().Length > 0)
+                        clan.Messages.Add(new MediusClanMessage { MessageId = _store.NextClanMessageId(), Text = message });
+                }
                 _store.MarkDirty();
                 status = MediusCallbackStatus.MediusSuccess;
             }
         }
 
-        _log.LogInformation("[MLS] AddPlayerToClan {Target} by {Me} -> {Status}", target?.AccountName ?? targetId.ToString(), me?.AccountName, status);
+        _log.LogInformation("[MLS] AddPlayerToClan {Target} by {Me} -> {Status}{Note}", target?.AccountName ?? targetId.ToString(),
+            me?.AccountName, status, invited ? " (invited: they join once they accept)" : "");
         return SendStatusAsync(packet, state, tcp, MediusLobbyMessageId.AddPlayerToClanResponse, status, ct);
     }
 }

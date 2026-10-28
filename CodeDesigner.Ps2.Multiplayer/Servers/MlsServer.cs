@@ -52,6 +52,12 @@ public partial class MlsServer : BaseMediusTcpServer
 
         var account = _store.GetAccountBySession(state.AccessKey);
         if (account == null) return null;
+        if (account.IsBanned || _admin.Bans.FindAccount(account.AccountName) != null)
+        {
+            _log.LogWarning("[MLS] Connection {Conn} presented a session of banned account '{Name}' — ignored",
+                state.ConnectionId, account.AccountName);
+            return null;
+        }
 
         state.AccountId   = account.AccountId;
         state.AccountName = account.AccountName;
@@ -70,7 +76,64 @@ public partial class MlsServer : BaseMediusTcpServer
     public Task StartAsync(CancellationToken ct)
     {
         StartInjectDropWatcher(ct);
+        _ = RunMaintenanceLoopAsync(ct);
         return StartAsync(_config.BindAddress, _config.MlsPort, ct);
+    }
+
+    /// <summary>A JoinGame reservation the console never connects to the DME with is released after this.</summary>
+    internal static readonly TimeSpan ReservationTtl = TimeSpan.FromSeconds(60);
+
+    /// <summary>An empty game world (and its game-list row) is removed this long after its last player left.</summary>
+    internal static readonly TimeSpan EmptyWorldGrace = TimeSpan.FromSeconds(60);
+
+    private async Task RunMaintenanceLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(10));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                try { SweepGames(); }
+                catch (Exception ex) { _log.LogError(ex, "[MLS] Game sweep failed"); }
+            }
+        }
+        catch (OperationCanceledException) { /* shutdown */ }
+    }
+
+    /// <summary>
+    /// Release stale DME reservations, destroy empty game worlds, and drop games (with their host reports and
+    /// vote-out bans) whose world is gone. Runs every 10 s; also called from tests.
+    /// </summary>
+    internal void SweepGames()
+    {
+        foreach (var world in DmeWorld.Sweep(ReservationTtl, EmptyWorldGrace))
+            _log.LogInformation("[MLS] {World} swept: empty for {S}s", world, EmptyWorldGrace.TotalSeconds);
+
+        foreach (var g in _store.AllGames.ToList())
+        {
+            var gw = g.DmeWorldId is int wid ? DmeWorld.GetById(wid) : null;
+            if ((gw == null || gw.MediusWorldId != g.GameId) && DateTime.UtcNow - g.CreatedAt > EmptyWorldGrace)
+                RemoveGame(g, "DME world gone");
+        }
+
+        var liveWorlds = DmeWorld.All.Select(w => w.MediusWorldId).ToHashSet();
+        foreach (var id in _worldReports.Keys)
+            if (!liveWorlds.Contains(id)) _worldReports.TryRemove(id, out _);
+        foreach (var (id, bans) in _gameBans)
+        {
+            foreach (var (acct, until) in bans)
+                if (until <= DateTime.UtcNow) bans.TryRemove(acct, out _);
+            if (bans.IsEmpty) _gameBans.TryRemove(id, out _);
+        }
+    }
+
+    /// <summary>Remove a player game and everything keyed by its MediusWorldID.</summary>
+    private void RemoveGame(MediusGame game, string reason)
+    {
+        if (!_store.RemoveGame(game.GameId)) return;
+        _worldReports.TryRemove(game.GameId, out _);
+        _gameBans.TryRemove(game.GameId, out _);
+        _log.LogInformation("[MLS] Game 0x{Id:X} '{Name}' removed ({Reason})", game.GameId, game.GameName, reason);
     }
 
     // Fire the SCERT session-established callback right after the old-proto handshake so
@@ -269,9 +332,7 @@ public partial class MlsServer : BaseMediusTcpServer
                     break;
 
                 case MediusLobbyMessageId.EndGameReport:
-                    // Host's end-of-game report (126 B: SessionKey | pad3 | WorldID | WinningTeam | WinningPlayer |
-                    // FinalScore) — one-way in horizon, no reply.
-                    _log.LogInformation("[MLS] EndGameReport received (one-way) from {Acct}", state.AccountName);
+                    HandleEndGameReport(packet, state);
                     break;
 
                 case MediusLobbyMessageId.TextFilter:
@@ -279,7 +340,15 @@ public partial class MlsServer : BaseMediusTcpServer
                     break;
 
                 case MediusLobbyMessageId.UpdateUserState:
-                    // Keepalive / status update — no response needed
+                    HandleUpdateUserState(packet, state);
+                    break;
+
+                case MediusLobbyMessageId.GetWorldSecurityLevel:
+                    await HandleGetWorldSecurityLevelAsync(packet, state, tcp, ct);
+                    break;
+
+                case MediusLobbyMessageId.GetMyIP:
+                    await HandleGetMyIpAsync(packet, state, tcp, ct);
                     break;
 
                 case MediusLobbyMessageId.GetLocations:
@@ -323,7 +392,7 @@ public partial class MlsServer : BaseMediusTcpServer
 
                 // Friends, ignore list, ladders and clans are answered in MlsServer.Social.cs (TryHandleSocialAsync).
                 case MediusLobbyMessageId.GetClanMemberList:
-                    await SendEmptyLobbyListAsync(packet, tcp, MediusLobbyMessageId.GetClanMemberListResponse, ct);
+                    await HandleGetClanMemberListPlainAsync(packet, state, tcp, ct);
                     break;
 
                 // ── Requests the SOCOM II client sends that used to go unanswered (MlsServer.Lobby.cs) ──
@@ -383,7 +452,7 @@ public partial class MlsServer : BaseMediusTcpServer
                     break;
 
                 case MediusLobbyExtMessageId.GenericChatMessage:
-                    await HandleGenericChatAsync(packet, state, tcp, ct);
+                    await HandleGenericChatAsync(packet, state, ct);
                     break;
 
                 case MediusLobbyExtMessageId.UtilGetServerVersion:
@@ -407,21 +476,9 @@ public partial class MlsServer : BaseMediusTcpServer
                     break;
 
                 case MediusLobbyExtMessageId.GetBuddyInvitations:
-                {
-                    // Community-screen batch (23 B, MessageID only). Retail answered 74 B (create_Masquarr), the Medius
-                    // SDK shape: header | AccountID | AccountName[32] | AddType | EndOfList @0x44 | pad3. The old
-                    // generic 290-byte empty list had zeros where this EndOfList sits. No pending invitations: one
-                    // NoResult row with EndOfList = 1.
-                    var w = new MediusWriter();
-                    WriteMlsHeader(w, packet, MediusCallbackStatus.MediusNoResult);
-                    w.Write(0);                                          // AccountID
-                    w.WriteString("", MediusConstants.ACCOUNTNAME_MAXLEN); // AccountName[32]
-                    w.Write(0);                                          // AddType
-                    w.Write((byte)1);                                    // EndOfList
-                    w.WritePadding(3);
-                    await SendMediusAsync(tcp, MediusPacket.BuildLobbyExt(MediusLobbyExtMessageId.GetBuddyInvitationsResponse, w.ToArray()), state, ct);
+                    // Community-screen batch (23 B, MessageID only). Retail answered 74 B (create_Masquarr).
+                    await HandleGetBuddyInvitationsAsync(packet, state, tcp, ct);
                     break;
-                }
 
                 default:
                     _log.LogDebug("[MLS] Unhandled lobbyExt msg 0x{Type:X2}", packet.MessageType);
@@ -436,12 +493,26 @@ public partial class MlsServer : BaseMediusTcpServer
 
     private async Task HandleSessionBeginAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
-        state.SessionKey = Guid.NewGuid().ToString("N")[..16].ToUpperInvariant();
+        state.SessionKey = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8));
         state.Status     = PlayerStatus.InChatWorld;
+        // Later requests on this connection may present this key (e.g. JoinChannel falls back to it), so it has to
+        // resolve to the same account as the connection's MAS key.
+        if (ResolveAccount(state) is { } account)
+            _store.RegisterSession(state.SessionKey, account.AccountId);
 
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
-        w.WriteString(state.SessionKey, 64);
+        if (_config.WireFixes.MlsHeaderEcho)
+        {
+            // The MAS SessionBeginResponse layout: header | SessionKey[17] | pad3.
+            WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+            w.WriteString(state.SessionKey, MediusConstants.SESSIONKEY_MAXLEN);
+            w.WritePadding(3);
+        }
+        else
+        {
+            w.Write((int)MediusCallbackStatus.MediusSuccess);
+            w.WriteString(state.SessionKey, 64);
+        }
 
         await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.SessionBeginResponse, w.ToArray()), ct);
     }
@@ -449,14 +520,24 @@ public partial class MlsServer : BaseMediusTcpServer
     private async Task HandleAccountLogoutAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
         state.Status = PlayerStatus.Disconnected;
+        _store.RevokeSession(state.AccessKey);
+        _store.RevokeSession(state.SessionKey);
+        if (_presenceByConnection.TryRemove(state.ConnectionId, out int loggedOut))
+            _presence.Disconnected(loggedOut);
+        state.AccountId   = null;
+        state.AccountName = string.Empty;
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
+        if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+        else w.Write((int)MediusCallbackStatus.MediusSuccess);
         await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.AccountLogoutResponse, w.ToArray()), ct);
     }
 
     private async Task HandleGetAnnouncementsAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
-        string msg = _config.ServerNews;
+        // ServerNews first, then any extra Announcements — one list row each, EndOfList on the last.
+        var items = new[] { _config.ServerNews }.Concat(_config.Announcements)
+            .Where(a => !string.IsNullOrWhiteSpace(a)).ToList();
+        if (items.Count == 0) items.Add(string.Empty);
 
         // GetAnnouncementsResponse = header | AnnouncementID | Announcement[1000] | EndOfList | pad3 — horizon
         // layout, 1038 B on the wire exactly like the retail acceptEULA reply. The old reply carried a 256-byte
@@ -464,24 +545,27 @@ public partial class MlsServer : BaseMediusTcpServer
         // receive-buffer bytes: non-zero = fine, zero = it waited for another announcement that never came and
         // the request timed out on the news screen (the intermittent community disconnect).
         const int AnnouncementLen = 1000;
-        var w = new MediusWriter();
-        WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
-        w.Write(1);                              // 0x1C AnnouncementID
-        w.WriteString(msg, AnnouncementLen);     // 0x20 Announcement[1000]
-        w.Write((byte)1);                        // 0x408 EndOfList
-        w.WritePadding(3);
-
-        await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.GetAnnouncementsResponse, w.ToArray()), state, ct);
+        for (int i = 0; i < items.Count; i++)
+        {
+            var w = new MediusWriter();
+            WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+            w.Write(i + 1);                                  // 0x1C AnnouncementID
+            w.WriteString(items[i], AnnouncementLen);        // 0x20 Announcement[1000]
+            w.Write((byte)(i == items.Count - 1 ? 1 : 0));   // 0x408 EndOfList
+            w.WritePadding(3);
+            await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.GetAnnouncementsResponse, w.ToArray()), state, ct);
+        }
     }
 
     private async Task HandleGetUniverseAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
         // Universe variable info — send a minimal response
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
+        if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+        else w.Write((int)MediusCallbackStatus.MediusSuccess);
         w.Write((byte)1);  // End of list
-        w.WriteString("CodeDesigner Universe", 64);
-        w.WriteString("http://localhost/", 128);
+        w.WriteString(_config.UniverseName, 64);
+        w.WriteString(_config.EffectivePatchUrl, 128);
 
         await SendMediusAsync(tcp, MediusPacket.BuildLobbyExt(MediusLobbyExtMessageId.UniverseStatusList_ExtraInfoResponse, w.ToArray()), ct);
     }
@@ -580,7 +664,10 @@ public partial class MlsServer : BaseMediusTcpServer
         return rooms.Select(r =>
         {
             var ch = _store.GetOrCreateChannel(r.WorldId, r.Name, appId, r.MaxPlayers);
+            // The room may have been seeded before any console connected (stats page, debug API) with AppId 0.
+            if (ch.AppId == 0 && appId != 0) ch.AppId = appId;
             ch.SecurityLevel = r.SecurityLevel;
+            ch.Password      = r.Password ?? string.Empty;
             ch.GenericField1 = unchecked((int)r.GenericField);
             return ch;
         }).ToList();
@@ -598,7 +685,8 @@ public partial class MlsServer : BaseMediusTcpServer
             bool isLast = i == channels.Count - 1;
 
             var w = new MediusWriter();
-            w.Write((int)MediusCallbackStatus.MediusSuccess);
+            if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+            else w.Write((int)MediusCallbackStatus.MediusSuccess);
             w.Write((byte)(isLast ? 1 : 0));
             w.Write(ch.ChannelId);
             w.WriteString(ch.ChannelName, 64);
@@ -608,7 +696,11 @@ public partial class MlsServer : BaseMediusTcpServer
             w.Write(ch.GenericField2);
             w.Write(ch.GenericField3);
 
-            await SendMediusAsync(tcp, MediusPacket.BuildLobbyExt(MediusLobbyExtMessageId.ChannelList_ExtraInfo, w.ToArray()), ct);
+            // Without the fix the reply goes out under the REQUEST type (0x1F).
+            var reply = _config.WireFixes.MlsHeaderEcho
+                ? MediusPacket.BuildLobby(MediusLobbyMessageId.ChannelList_ExtraInfoResponse, w.ToArray())
+                : MediusPacket.BuildLobbyExt(MediusLobbyExtMessageId.ChannelList_ExtraInfo, w.ToArray());
+            await SendMediusAsync(tcp, reply, ct);
         }
     }
 
@@ -626,7 +718,7 @@ public partial class MlsServer : BaseMediusTcpServer
         var channel = _store.GetChannelById(worldId);
         var status =
             channel == null                                          ? MediusCallbackStatus.MediusChannelNotFound
-            : channel.SecurityLevel != 0 && password != channel.Password ? MediusCallbackStatus.MediusInvalidPassword
+            : channel.Password.Length > 0 && password != channel.Password ? MediusCallbackStatus.MediusInvalidPassword
             : channel.IsFull                                         ? MediusCallbackStatus.MediusWorldIsFull
             : MediusCallbackStatus.MediusSuccess;
 
@@ -637,7 +729,13 @@ public partial class MlsServer : BaseMediusTcpServer
 
         if (status == MediusCallbackStatus.MediusSuccess)
         {
-            if (state.AccountId.HasValue) channel!.AddPlayer(state.AccountId.Value);
+            if (state.AccountId is int joiner)
+            {
+                // Hopping rooms: leave the previous one, or its roster (and IsFull) keeps counting this player.
+                if (state.CurrentChannelId is int previous && previous != channel!.ChannelId)
+                    _store.GetChannelById(previous)?.RemovePlayer(joiner);
+                channel!.AddPlayer(joiner);
+            }
             state.CurrentChannelId = channel!.ChannelId;
             state.Status           = PlayerStatus.InChatWorld;
 
@@ -699,10 +797,9 @@ public partial class MlsServer : BaseMediusTcpServer
         {
             // A player game whose DME world emptied out (host left) is gone — drop it from the list.
             var gw = g.DmeWorldId is int wid ? DmeWorld.GetById(wid) : null;
-            if ((gw == null || gw.MediusWorldId != g.GameId) && DateTime.UtcNow - g.CreatedAt > TimeSpan.FromSeconds(60))
+            if ((gw == null || gw.MediusWorldId != g.GameId) && DateTime.UtcNow - g.CreatedAt > EmptyWorldGrace)
             {
-                _store.RemoveGame(g.GameId);
-                _log.LogInformation("[MLS] Game 0x{Id:X} '{Name}' removed (DME world gone)", g.GameId, g.GameName);
+                RemoveGame(g, "DME world gone");
                 continue;
             }
             if (room != null && g.LobbyChannelId != 0 && g.LobbyChannelId != room.ChannelId)
@@ -710,11 +807,18 @@ public partial class MlsServer : BaseMediusTcpServer
             entries.Add(PlayerGameEntry(g, room, gw?.ConnectedCount ?? g.PlayerCount));
         }
 
+        if (_config.ApplyGameListFilters && !state.GameListFilters.IsEmpty)
+        {
+            var filters = state.GameListFilters.Values.ToList();
+            entries = entries.Where(e => filters.All(f => f.Matches(FilterValue(e, f.Field, room)))).ToList();
+        }
+
         if (entries.Count == 0)
         {
             // No games in the room is a normal retail state — reply with the proven empty-list body.
             var wEmpty = new MediusWriter();
-            WriteEmptyListBody(wEmpty, packet);
+            if (_config.WireFixes.EmptyGameListEndOfList) WriteEmptyGameListRow(wEmpty, packet);
+            else WriteEmptyListBody(wEmpty, packet);
             await SendMediusAsync(tcp, MediusPacket.BuildLobby(responseType, wEmpty.ToArray()), ct);
             return;
         }
@@ -730,8 +834,24 @@ public partial class MlsServer : BaseMediusTcpServer
         }
     }
 
+    /// <summary>The value a game-list filter field compares, for one row.</summary>
+    internal static int FilterValue(GameListEntry e, MediusGameListFilterField field, MediusChannel? room) => field switch
+    {
+        MediusGameListFilterField.MEDIUS_FILTER_PLAYER_COUNT       => e.PlayerCount,
+        MediusGameListFilterField.MEDIUS_FILTER_MIN_PLAYERS        => e.MinPlayers,
+        MediusGameListFilterField.MEDIUS_FILTER_MAX_PLAYERS        => e.MaxPlayers,
+        MediusGameListFilterField.MEDIUS_FILTER_GAME_LEVEL         => e.GameLevel,
+        MediusGameListFilterField.MEDIUS_FILTER_PLAYER_SKILL_LEVEL => e.PlayerSkillLevel,
+        MediusGameListFilterField.MEDIUS_FILTER_RULES_SET          => e.RulesSet,
+        MediusGameListFilterField.MEDIUS_FILTER_GENERIC_FIELD_1    => e.GenericField1,
+        MediusGameListFilterField.MEDIUS_FILTER_GENERIC_FIELD_2    => e.GenericField2,
+        MediusGameListFilterField.MEDIUS_FILTER_GENERIC_FIELD_3    => e.GenericField3,
+        MediusGameListFilterField.MEDIUS_FILTER_LOBBY_WORLDID      => room?.ChannelId ?? 0,
+        _                                                          => 0,
+    };
+
     /// <summary>One game-list row, in the order the 0xEB wire struct carries it.</summary>
-    private sealed record GameListEntry(
+    internal sealed record GameListEntry(
         int WorldId, int PlayerCount, int MinPlayers, int MaxPlayers,
         int GameLevel, int PlayerSkillLevel, int RulesSet,
         int GenericField1, int GenericField2, int GenericField3,
@@ -816,7 +936,8 @@ public partial class MlsServer : BaseMediusTcpServer
         if (games.Count == 0)
         {
             var wEmpty = new MediusWriter();
-            wEmpty.Write((int)MediusCallbackStatus.MediusNoResult);
+            if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(wEmpty, packet, MediusCallbackStatus.MediusNoResult);
+            else wEmpty.Write((int)MediusCallbackStatus.MediusNoResult);
             wEmpty.Write((byte)1);
             await SendMediusAsync(tcp, MediusPacket.BuildLobbyExt(MediusLobbyExtMessageId.GameList_ExtraInfoResponse, wEmpty.ToArray()), ct);
             return;
@@ -826,7 +947,7 @@ public partial class MlsServer : BaseMediusTcpServer
         {
             var g = games[i];
             bool isLast = i == games.Count - 1;
-            await SendGameListEntryExt(tcp, g, isLast, ct);
+            await SendGameListEntryExt(tcp, packet, g, isLast, ct);
         }
     }
 
@@ -868,7 +989,23 @@ public partial class MlsServer : BaseMediusTcpServer
             password.Length > 0 ? (spectatorPassword.Length > 0 ? "game+spectator" : "game") : spectatorPassword.Length > 0 ? "spectator" : "none",
             state.WorldId ?? 0);
 
-        var game = _store.CreateGame(gameName, state.AppId, state.AccountId ?? 0, state.AccountName, maxPlayers);
+        // A DME world holds 1..32 players; keep the listed limits consistent with it.
+        maxPlayers = Math.Clamp(maxPlayers, 1, DmeWorld.MaxClientsPerWorld);
+        minPlayers = Math.Clamp(minPlayers, 0, maxPlayers);
+        // Games are listed per briefing room. The community connection's world (1) is no room: list those everywhere.
+        int lobbyId = state.WorldId is int lw && _store.GetChannelById(lw) != null ? lw : 0;
+        int hostId  = state.AccountId ?? 0;
+
+        bool nameTaken = _store.GetGames(state.AppId).Any(g =>
+            g.LobbyChannelId == lobbyId && g.HostAccountId != hostId
+            && string.Equals(BaseGameName(g.GameName), BaseGameName(gameName), StringComparison.OrdinalIgnoreCase));
+        if (nameTaken)
+        {
+            await SendCreateGameFailureAsync(packet, state, tcp, MediusCallbackStatus.MediusGameNameExists, gameName, ct);
+            return;
+        }
+
+        var game = _store.CreateGame(gameName, state.AppId, hostId, state.AccountName, maxPlayers);
         game.MinPlayers       = minPlayers;
         game.GameLevel        = gameLevel;
         game.PlayerSkillLevel = skillLevel;
@@ -880,11 +1017,17 @@ public partial class MlsServer : BaseMediusTcpServer
         game.GenericField3    = generic[2];
         game.GenericField4    = generic[3];
         game.GameHostType     = hostType;
-        game.LobbyChannelId   = state.WorldId ?? 0;
+        game.LobbyChannelId   = lobbyId;
         game.GameStats[0]     = (byte)game.LobbyChannelId;
         game.GameStats[6]     = 0x7F;                // retail player-made games carry index 0x7F
 
-        var world = DmeServer.CreateWorld(game.GameId, state.AppId, maxPlayers);
+        var world = DmeServer.TryCreateWorld(game.GameId, state.AppId, maxPlayers);
+        if (world == null)
+        {
+            RemoveGame(game, "no free DME world id");
+            await SendCreateGameFailureAsync(packet, state, tcp, MediusCallbackStatus.MediusFail, gameName, ct);
+            return;
+        }
         world.SelfDestructFlag = true;
         game.DmeWorldId = world.WorldId;
 
@@ -894,6 +1037,24 @@ public partial class MlsServer : BaseMediusTcpServer
 
         _log.LogInformation("[MLS] CreateGame -> world 0x{Id:X} ({World})", game.GameId, world);
         await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.CreateGameResponse, w.ToArray()), state, ct);
+    }
+
+    /// <summary>CreateGameResponse with a failure status: same size as success (MediusWorldID 0).</summary>
+    private async Task SendCreateGameFailureAsync(MediusPacket packet, MediusClientState state, TcpClient tcp,
+        MediusCallbackStatus status, string gameName, CancellationToken ct)
+    {
+        var w = new MediusWriter();
+        WriteMlsHeader(w, packet, status);
+        w.Write(0);
+        _log.LogInformation("[MLS] CreateGame '{Name}' -> {Status}", gameName, status);
+        await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.CreateGameResponse, w.ToArray()), state, ct);
+    }
+
+    /// <summary>A game name without the "$~room" suffix the list adds.</summary>
+    private static string BaseGameName(string name)
+    {
+        int cut = name.IndexOf("$~", StringComparison.Ordinal);
+        return (cut >= 0 ? name[..cut] : name).Trim();
     }
 
     /// <summary>
@@ -935,7 +1096,13 @@ public partial class MlsServer : BaseMediusTcpServer
         if (status == MediusCallbackStatus.MediusSuccess)
         {
             slot = world!.Reserve(sessionKey, state.AccountId ?? 0, spectator);
-            if (slot == null) status = MediusCallbackStatus.MediusWorldIsFull;
+            // The world can be swept between the lookup and the reservation; a fresh one takes the join.
+            if (slot == null && world.IsDestroyed)
+            {
+                world = game != null ? GetOrCreatePlayerGameWorld(game) : GetOrCreateDefaultGameWorld(worldId, state.AppId);
+                slot = world?.Reserve(sessionKey, state.AccountId ?? 0, spectator);
+            }
+            if (slot == null) status = world == null ? MediusCallbackStatus.MediusGameNotFound : MediusCallbackStatus.MediusWorldIsFull;
         }
 
         var w = new MediusWriter();
@@ -943,7 +1110,13 @@ public partial class MlsServer : BaseMediusTcpServer
         w.Write(game?.GameHostType ?? 0);                                   // GameHostType (retail defaults: 0)
         if (slot != null)
         {
-            if (state.AccountId.HasValue) game?.AddPlayer(state.AccountId.Value);
+            if (state.AccountId is int member)
+            {
+                // Joining another game: leave the previous one, or its player count stays inflated.
+                if (state.CurrentGameId is int previous && previous != worldId)
+                    _store.GetGameById(previous)?.RemovePlayer(member);
+                game?.AddPlayer(member);
+            }
             state.CurrentGameId = worldId;
             state.Status        = PlayerStatus.InGameWorld;
             if (state.AccountId is int joiner)
@@ -995,7 +1168,12 @@ public partial class MlsServer : BaseMediusTcpServer
         {
             if (_defaultGameWorlds.TryGetValue(mediusWorldId, out var existing) && DmeWorld.GetById(existing.WorldId) == existing)
                 return existing;
-            var world = DmeServer.CreateWorld(mediusWorldId, appId, DefaultGameMaxPlayers);
+            var world = DmeServer.TryCreateWorld(mediusWorldId, appId, DefaultGameMaxPlayers);
+            if (world == null)
+            {
+                _log.LogWarning("[MLS] No free DME world id for default room 0x{Id:X}", mediusWorldId);
+                return null;
+            }
             world.SelfDestructFlag = true;
             _defaultGameWorlds[mediusWorldId] = world;
             _gameBans.TryRemove(mediusWorldId, out _);   // a fresh session of a default room starts with no vote-outs
@@ -1005,12 +1183,18 @@ public partial class MlsServer : BaseMediusTcpServer
 
     private static DmeWorld? GetOrCreatePlayerGameWorld(MediusGame game)
     {
-        if (game.DmeWorldId is int id && DmeWorld.GetById(id) is { } world && world.MediusWorldId == game.GameId)
-            return world;
-        var created = DmeServer.CreateWorld(game.GameId, game.AppId, game.MaxPlayers);
-        created.SelfDestructFlag = true;
-        game.DmeWorldId = created.WorldId;
-        return created;
+        // Two joins racing on a game whose world died must not each create one (the first joiner would be
+        // left reserved in an orphan).
+        lock (game)
+        {
+            if (game.DmeWorldId is int id && DmeWorld.GetById(id) is { } world && world.MediusWorldId == game.GameId)
+                return world;
+            var created = DmeServer.TryCreateWorld(game.GameId, game.AppId, game.MaxPlayers);
+            if (created == null) return null;
+            created.SelfDestructFlag = true;
+            game.DmeWorldId = created.WorldId;
+            return created;
+        }
     }
 
     /// <summary>Retail default rooms list 2–24 players.</summary>
@@ -1037,29 +1221,6 @@ public partial class MlsServer : BaseMediusTcpServer
     }
 
     /// <summary>
-    /// Minimal "empty list" reply for a community-screen init query: header + an
-    /// end-of-list marker. Success (not an error) with no entries so the client
-    /// stops waiting and the lobby doesn't time out. Used for buddy/ignore/clan/
-    /// ladder lists, which are legitimately empty on a fresh private server.
-    /// </summary>
-    private async Task SendEmptyLobbyListAsync(MediusPacket packet, TcpClient tcp, MediusLobbyMessageId responseType, CancellationToken ct)
-    {
-        var w = new MediusWriter();
-        WriteEmptyListBody(w, packet);
-        _log.LogDebug("[MLS] -> {Resp} (empty list)", responseType);
-        await SendMediusAsync(tcp, MediusPacket.BuildLobby(responseType, w.ToArray()), ct);
-    }
-
-    /// <summary>LobbyExt-class variant of <see cref="SendEmptyLobbyListAsync"/>.</summary>
-    private async Task SendEmptyLobbyExtListAsync(MediusPacket packet, TcpClient tcp, MediusLobbyExtMessageId responseType, CancellationToken ct)
-    {
-        var w = new MediusWriter();
-        WriteEmptyListBody(w, packet);
-        _log.LogDebug("[MLS] -> {Resp} (empty list)", responseType);
-        await SendMediusAsync(tcp, MediusPacket.BuildLobbyExt(responseType, w.ToArray()), ct);
-    }
-
-    /// <summary>
     /// Body for an empty list reply. Status = <see cref="MediusCallbackStatus.MediusNoResult"/>
     /// (the game's own "no entries" signal — see HandleGameListAsync) so the parser does NOT
     /// read any entry fields. CRITICAL: the minimal 32-byte form let the game read a full
@@ -1068,6 +1229,15 @@ public partial class MlsServer : BaseMediusTcpServer
     /// likely garbage IDs behind the disconnect. We zero-pad past the largest entry struct so any
     /// field the parser still touches reads clean zeros instead of leftover buffer.
     /// </summary>
+    /// <summary>An empty game list as one full 0x190-byte row: NoResult, zeroed fields, EndOfList at 0x18C like a real row.</summary>
+    internal static void WriteEmptyGameListRow(MediusWriter w, MediusPacket packet)
+    {
+        WriteMlsHeader(w, packet, MediusCallbackStatus.MediusNoResult);   // 0x00 .. 0x1C
+        w.WritePadding(0x18C - 0x1C);                                     // row fields, all zero
+        w.Write((byte)1);                                                 // 0x18C EndOfList
+        w.WritePadding(3);                                                // → 0x190
+    }
+
     private static void WriteEmptyListBody(MediusWriter w, MediusPacket packet)
     {
         WriteMlsHeader(w, packet, MediusCallbackStatus.MediusNoResult);  // msgId + pad + status
@@ -1147,7 +1317,7 @@ public partial class MlsServer : BaseMediusTcpServer
             // AccountID before the name, so the client read PlayerStatus from zeroed stats = 0 (Disconnected).
             w.WriteString(name, MediusConstants.ACCOUNTNAME_MAXLEN);            // 0x1C AccountName[32]
             w.Write(state.AppId);                                               // 0x3C ApplicationID
-            w.Write((int)MediusPlayerStatus.MediusPlayerInChatWorld);          // 0x40 PlayerStatus
+            w.Write((int)(_presence.Get(accountId)?.Status ?? MediusPlayerStatus.MediusPlayerInChatWorld)); // 0x40 PlayerStatus
             w.Write((int)MediusConnectionType.Ethernet);                       // 0x44 ConnectionClass
             w.Write(Fixed(account?.AccountStats, MediusConstants.ACCOUNTSTATS_MAXLEN)); // 0x48 Stats[256]
         }
@@ -1169,6 +1339,14 @@ public partial class MlsServer : BaseMediusTcpServer
 
     private async Task HandleSetGameListFilterAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
+        if (GameListFilter.Parse(packet.Payload) is { } filter)
+        {
+            state.GameListFilters[(int)filter.Field] = filter;
+            _log.LogInformation("[MLS] SetGameListFilter0 {Field} & 0x{Mask:X} {Op} {Baseline} (world 0x{World:X}){Applied}",
+                filter.Field, filter.Mask, filter.Op, filter.BaselineValue, state.WorldId ?? 0,
+                _config.ApplyGameListFilters ? "" : " — recorded, not applied (ApplyGameListFilters off)");
+        }
+
         // Briefing-room connection: retail DOES answer. Hash-verified against the Join_US_East and
         // create_Masquarr captures: the constant 30-byte reply (hash fb182a2e) is exactly
         // 01 4F + MessageID(21 zero) + pad(90 FF BF, uninitialised server stack) + StatusCode 0 — the v108
@@ -1236,7 +1414,8 @@ public partial class MlsServer : BaseMediusTcpServer
 
             if (ladderType == (int)MediusLadderType.MediusLadderTypeClan)
             {
-                if (_store.GetClanById(account.ClanId) is { } clan) clan.LadderStats = stats;
+                if (_store.GetClanById(account.ClanId) is { } clan && clan.LeaderAccountId == account.AccountId)
+                    clan.LadderStats = stats;
             }
             else
             {
@@ -1376,15 +1555,28 @@ public partial class MlsServer : BaseMediusTcpServer
             PlayerSkillLevel: r.ReadInt32(), RulesSet: r.ReadInt32(), GenericField1: r.ReadInt32(),
             GenericField2: r.ReadInt32(), GenericField3: r.ReadInt32(), WorldStatus: r.ReadInt32());
 
+        // Only a player in that game world (or the game's host) may describe it; anyone else could rename or
+        // close other people's games.
+        var reportedGame = _store.GetGameById(worldId);
+        if (state.AccountId is not int reporter
+            || (reportedGame?.HostAccountId != reporter
+                && !DmeWorld.All.Any(w => w.MediusWorldId == worldId && w.Clients.Values.Any(c => c.AccountId == reporter))))
+        {
+            _log.LogDebug("[MLS] WorldReport0 for world 0x{World:X} from {Acct} ignored: not in that game", worldId, state.AccountName);
+            return;
+        }
+
         bool first = !_worldReports.ContainsKey(worldId);
         _worldReports[worldId] = report;
 
-        if (_store.GetGameById(worldId) is { } game)
+        if (reportedGame is { } game)
         {
             game.GameName         = report.GameName;
             game.GameStats        = report.GameStats;
             game.MinPlayers       = report.MinPlayers;
-            game.MaxPlayers       = report.MaxPlayers;
+            // The DME world's slot count is fixed at creation; never list more seats than it has.
+            int seats = game.DmeWorldId is int dw && DmeWorld.GetById(dw) is { } gw ? gw.MaxPlayers : DmeWorld.MaxClientsPerWorld;
+            game.MaxPlayers       = Math.Clamp(report.MaxPlayers, 1, seats);
             game.GameLevel        = report.GameLevel;
             game.PlayerSkillLevel = report.PlayerSkillLevel;
             game.RulesSet         = report.RulesSet;
@@ -1397,6 +1589,94 @@ public partial class MlsServer : BaseMediusTcpServer
         if (first)
             _log.LogInformation("[MLS] WorldReport0 world=0x{World:X} '{Name}' players={Count} status={Status} GF2=0x{GF2:X} from {Acct}",
                 worldId, report.GameName, report.PlayerCount, report.WorldStatus, report.GenericField2, state.AccountName);
+    }
+
+    /// <summary>
+    /// EndGameReport (126 B, one-way): SessionKey[17] | pad3 | MediusWorldID | WinningTeam[64] | WinningPlayer[32] |
+    /// FinalScore (horizon MediusEndGameReport). Accepted from a player in that game, like WorldReport0; the result is
+    /// kept on the game (shown by the debug /rooms report) and the game is marked closed. The world itself is cleaned
+    /// up by the sweep once its players leave.
+    /// </summary>
+    private void HandleEndGameReport(MediusPacket packet, MediusClientState state)
+    {
+        var r = new MediusReader(packet.Payload);
+        if (r.Remaining < MediusConstants.SESSIONKEY_MAXLEN + 3 + 4) return;
+        r.Skip(MediusConstants.SESSIONKEY_MAXLEN + 3);
+        int worldId = r.ReadInt32();
+        string team   = r.Remaining >= 64 ? r.ReadString(64) : "";
+        string player = r.Remaining >= MediusConstants.ACCOUNTNAME_MAXLEN ? r.ReadString(MediusConstants.ACCOUNTNAME_MAXLEN) : "";
+        int score     = r.Remaining >= 4 ? r.ReadInt32() : 0;
+
+        var game = _store.GetGameById(worldId);
+        bool inGame = state.AccountId is int reporter
+            && (game?.HostAccountId == reporter
+                || DmeWorld.All.Any(w => w.MediusWorldId == worldId && w.Clients.Values.Any(c => c.AccountId == reporter)));
+        if (!inGame)
+        {
+            _log.LogDebug("[MLS] EndGameReport for world 0x{World:X} from {Acct} ignored: not in that game", worldId, state.AccountName);
+            return;
+        }
+
+        if (game != null)
+        {
+            game.Result = new GameResult(team, player, score, DateTime.UtcNow);
+            game.Status = GameWorldStatus.WorldClosed;
+        }
+        _log.LogInformation("[MLS] Game 0x{World:X} '{Name}' ended: team '{Team}', player '{Player}', score {Score} (reported by {Acct})",
+            worldId, game?.GameName ?? "default room", team, player, score, state.AccountName);
+    }
+
+    /// <summary>
+    /// UpdateUserState (one-way): SessionKey[17] | pad3 | UserAction @20 (horizon MediusUpdateUserState).
+    /// LeftGameWorld puts the player back in the lobby (presence, the game's roster); JoinedChatWorld marks them in
+    /// the chat world; KeepAlive is just that.
+    /// </summary>
+    private void HandleUpdateUserState(MediusPacket packet, MediusClientState state)
+    {
+        const int actionAt = MediusConstants.SESSIONKEY_MAXLEN + 3;
+        if (packet.Payload.Length < actionAt + 4 || state.AccountId is not int account) return;
+        var action = (MediusUserAction)BitConverter.ToInt32(packet.Payload, actionAt);
+
+        switch (action)
+        {
+            case MediusUserAction.LeftGameWorld:
+                if (state.CurrentGameId is int gameId) _store.GetGameById(gameId)?.RemovePlayer(account);
+                state.CurrentGameId = null;
+                state.Status        = PlayerStatus.InChatWorld;
+                _presence.LeftGame(account);
+                _log.LogDebug("[MLS] {Acct} left their game world", state.AccountName);
+                break;
+            case MediusUserAction.JoinedChatWorld:
+                state.Status = PlayerStatus.InChatWorld;
+                break;
+        }
+    }
+
+    /// <summary>
+    /// GetWorldSecurityLevel (MLS): MessageID[21] | SessionKey[17] | pad2 | MediusWorldID @0x28 | AppType @0x2C →
+    /// header | SecurityLevel (the MAS layout). A room or game with a password reports PLAYER_PASSWORD, else NONE.
+    /// </summary>
+    private async Task HandleGetWorldSecurityLevelAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
+    {
+        const int worldAt = MediusConstants.MESSAGEID_MAXLEN + MediusConstants.SESSIONKEY_MAXLEN + 2;
+        int worldId = packet.Payload.Length >= worldAt + 4 ? BitConverter.ToInt32(packet.Payload, worldAt) : 0;
+        bool locked = _store.GetChannelById(worldId) is { } room ? room.Password.Length > 0
+                    : _store.GetGameById(worldId) is { } game && game.IsLocked;
+
+        var w = new MediusWriter();
+        WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+        w.Write((int)(locked ? MediusWorldSecurityLevelType.WORLD_SECURITY_PLAYER_PASSWORD : MediusWorldSecurityLevelType.WORLD_SECURITY_NONE));
+        await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.GetWorldSecurityLevelResponse, w.ToArray()), state, ct);
+    }
+
+    /// <summary>GetMyIP (MLS): MessageID | SessionKey → header | IP[20] (the MAS layout), the address this connection comes from.</summary>
+    private async Task HandleGetMyIpAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
+    {
+        var ip = (tcp.Client.RemoteEndPoint as System.Net.IPEndPoint)?.Address.MapToIPv4().ToString() ?? "";
+        var w = new MediusWriter();
+        WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+        w.WriteString(ip, MediusConstants.IP_MAXLEN);
+        await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.GetMyIPResponse, w.ToArray()), state, ct);
     }
 
     /// <summary>Latest host report for a world, only while its DME world is still alive.</summary>
@@ -1463,23 +1743,25 @@ public partial class MlsServer : BaseMediusTcpServer
         await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.GameInfoResponse0, w.ToArray()), state, ct);
     }
 
-    private async Task HandleGenericChatAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
-    {
-        // Similar to chat but using the ext message class
-        var r       = new MediusReader(packet.Payload);
-        string key  = r.ReadString(64);
-        string msg  = r.ReadString(512);
-        _log.LogInformation("[MLS] GenericChat from {User}: {Msg}", state.AccountName, msg);
-        // Forward to channel members
-    }
-
     private async Task HandleGetLocationsAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
-        w.Write((byte)1);   // EndOfList
-        w.Write(0);         // LocationId
-        w.WriteString("Default", 64);
+        if (_config.WireFixes.MlsHeaderEcho)
+        {
+            // header | LocationID | LocationName[64] | EndOfList | pad3
+            WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+            w.Write(0);
+            w.WriteString(_config.UniverseName, 64);
+            w.Write((byte)1);
+            w.WritePadding(3);
+        }
+        else
+        {
+            w.Write((int)MediusCallbackStatus.MediusSuccess);
+            w.Write((byte)1);   // EndOfList
+            w.Write(0);         // LocationId
+            w.WriteString("Default", 64);
+        }
 
         await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.GetLocationsResponse, w.ToArray()), ct);
     }
@@ -1487,7 +1769,8 @@ public partial class MlsServer : BaseMediusTcpServer
     private async Task HandlePickLocationAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
+        if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+        else w.Write((int)MediusCallbackStatus.MediusSuccess);
 
         await SendMediusAsync(tcp, MediusPacket.BuildLobby(MediusLobbyMessageId.PickLocationResponse, w.ToArray()), ct);
     }
@@ -1521,8 +1804,9 @@ public partial class MlsServer : BaseMediusTcpServer
     private async Task HandleUtilGetServerVersionAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
-        w.WriteString("CodeDesigner MLS 1.0", 64);
+        if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+        else w.Write((int)MediusCallbackStatus.MediusSuccess);
+        w.WriteString(_config.WireFixes.MlsHeaderEcho ? RetailLobbyServerVersion : "CodeDesigner MLS 1.0", 64);
 
         await SendMediusAsync(tcp, MediusPacket.BuildLobbyExt(MediusLobbyExtMessageId.UtilGetServerVersionResponse, w.ToArray()), ct);
     }
@@ -1531,10 +1815,11 @@ public partial class MlsServer : BaseMediusTcpServer
     // Private helpers
     // -------------------------------------------------------------------------
 
-    private async Task SendGameListEntryExt(TcpClient tcp, MediusGame g, bool isLast, CancellationToken ct)
+    private async Task SendGameListEntryExt(TcpClient tcp, MediusPacket packet, MediusGame g, bool isLast, CancellationToken ct)
     {
         var w = new MediusWriter();
-        w.Write((int)MediusCallbackStatus.MediusSuccess);
+        if (_config.WireFixes.MlsHeaderEcho) WriteMlsHeader(w, packet, MediusCallbackStatus.MediusSuccess);
+        else w.Write((int)MediusCallbackStatus.MediusSuccess);
         w.Write((byte)(isLast ? 1 : 0));
         w.Write(g.GameId);
         w.WriteString(g.GameName, 64);

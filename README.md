@@ -44,7 +44,8 @@ address (a hostname is re-resolved every minute). Medius names still point at `S
 authenticate with the external DNAS server and play on this one. Outside compose, the setting is
 `Online__ExternalDnasServer`; on Azure it's `-ExternalDnasServer`.
 
-Logs: `docker compose logs -f`. Set `LOG_LEVEL=Debug` to log full packet hex.
+Logs: `docker compose logs -f`. The default level is Information; set `LOG_LEVEL=Debug` to log full packet hex.
+The container reports healthy once the patch server's `/stats` endpoint answers (`docker compose ps`).
 
 Ports 53, 80 and 443 must be free on the host. On Linux, `systemd-resolved` often holds 53. On Windows,
 IIS or another web server may hold 80 or 443.
@@ -53,7 +54,8 @@ IIS or another web server may hold 80 or 443.
 
 | Path | Contents |
 |---|---|
-| `server-data.json`, `bans.json`, `cheat-scan.json` | Accounts, stats, friends, clans, bans |
+| `server-data.json` (+ `server-data.json.bak`) | Accounts, stats, friends, clans. The previous snapshot is kept as `.bak` and loaded if the main file is ever unreadable |
+| `bans.json`, `cheat-scan.json` | Account/IP bans, and the lobby memory-scanner settings (both reload when edited) |
 | `dnas/RSA/Signatures/<SERIAL>.BIN` | DNAS tickets, cached the first time a title logs in |
 | `dnas/PacketLogs/` | DnaSDK's per-session DNAS request/response captures |
 | `patch/APACHE00.ZDB` | The patch file to serve. Copy it in yourself; it is not in this repo |
@@ -72,9 +74,37 @@ override them, and so does an extra JSON file named by `MULTIPLAYER_CONFIG`. The
 | Variable | Default | Notes |
 |---|---|---|
 | `Online__ServerIp` | `auto` | The IP announced to consoles. `auto` resolves `Online__PublicHostname`, or falls back to a public-IP lookup |
-| `Online__DnsForwardUnknown` | `false` | `true` forwards other DNS names upstream (compose turns this on for LAN use). Keep it `false` on a public IP |
+| `Online__DnsForwardUnknown` | `false` | `true` forwards other DNS names upstream (compose turns this on for LAN use). Keep it `false` on a public IP. This is also the default outside the container now |
 | `Online__DataDirectory` | `/data` | |
-| `MULTIPLAYER_LOG_FILE` | `none` | Logs go to stdout only |
+| `MULTIPLAYER_LOG_FILE` | `none` | Logs go to stdout only. Outside the container the default is `multiplayer.log` next to the binary; it is appended to and rolls to `.1`–`.3` at 50 MB |
+
+Connection and access settings (all optional):
+
+| Setting | Default | Notes |
+|---|---|---|
+| `AllowedAppIds` | empty | AppIds allowed to connect; empty accepts any. SOCOM II NTSC-U reports 10472. A refused console is logged with its AppId. A list in the config replaces the default instead of being appended to it |
+| `ClientTimeoutSeconds` | `60` | A connection that hasn't finished the SCERT handshake by then is closed. `0` = no limit |
+| `IdleTimeoutSeconds` | `900` | An established connection that sends nothing for this long is closed. In-lobby and in-game consoles heartbeat on their own. `0` = no limit |
+| `MaxClients` | `1000` | Connections per Medius/DME listener. `0` = no limit |
+| `MaxConnectionsPerIp` | `32` | Connections per remote IP per listener. Consoles behind one NAT share an IP. `0` = no limit |
+| `BriefingRooms[].Password` | empty | A room with a password only admits JoinChannel requests that present it |
+| `DebugApiPort` / `DebugApiToken` | `0` / empty | The localhost debug API. Every request must send an `X-Debug-Token` header (any value when no token is set) |
+
+Lobby settings (all optional):
+
+| Setting | Default | Notes |
+|---|---|---|
+| `ServerNews` / `Announcements` | welcome text / empty | The in-lobby news panel: `ServerNews` first, then each `Announcements` entry as its own item |
+| `ApplicationName` | `SOCOM II` | Shown in FindPlayer / find-room results |
+| `ApplyGameListFilters` | `false` | Apply the filters a console sets with SetGameListFilter0 to its game list. They are always logged; check the log before turning this on, because a wrong match hides games |
+
+Friends and clans need the other player's say. Adding a friend puts them on your list and leaves a buddy
+invitation for them, and the friendship becomes mutual when they add you back. A clan leader's "add player"
+sends an invitation, and the player joins once they accept it.
+
+Passwords are stored as salted PBKDF2 hashes. Older SHA-1 hashes still work and are upgraded at the next login.
+`TicketLogin` can create a new account or use a password-less one, but it can't log in to an account that has a
+password; those have to use the normal account login.
 
 DNAS settings (all optional):
 
@@ -91,6 +121,26 @@ DNAS settings (all optional):
 
 The DNAS code doesn't replay these packets. It runs a live exchange for every session. From a title's captured S1
 it takes only the original 128-byte signed ticket, which the retail client checks.
+
+### Wire-format fixes to test on hardware
+
+Some replies don't match the horizon layouts. The fixes are written, but they haven't been confirmed on a console,
+so each one sits behind a flag under `WireFixes` that is off by default. With every flag off the server behaves
+as it did before. Turn on one flag at a time, for example `Online__WireFixes__MlsHeaderEcho=true`, or
+`"WireFixes": { "MlsHeaderEcho": true }` inside `Online` in `config.json`. Then run the check for that flag. If
+anything regresses, turn the flag back off.
+
+| Flag | What changes | What to check |
+|---|---|---|
+| `NetConnectionInfo154` | Login, JoinChannel and JoinGame replies carry the 154-byte v108 NetConnectionInfo instead of 156 bytes | Log in, enter a briefing room, create a game and join a game. This touches the most important replies, so test it first and on its own |
+| `MlsHeaderEcho` | Several MLS replies get the MessageID echo header: SessionBegin, AccountLogout, GetLocations, PickLocation, UtilGetServerVersion and the LobbyExt list replies | Log in, stay on the community screen past 2 minutes, enter and leave rooms, log out |
+| `EmptyGameListEndOfList` | An empty game list is one full 0x190-byte row | Enter a room with no games (set `DefaultGames` to `[]`). The list should show empty, with no stall or disconnect |
+| `MasExtendedSessionBeginPad` | ExtendedSessionBeginResponse gets the 3-byte pad | Only matters for clients that send ExtendedSessionBegin. SOCOM II normally sends SessionBegin |
+| `TicketLoginEncrypted` | TicketLoginResponse carries the server key and is encrypted | Only matters for clients that log in with TicketLogin |
+| `MuisLegacyGetUniverse` | A Lobby-class GetUniverse on MUIS gets the 0x120-byte GetUniverseResponse body | Only matters for clients that send the Lobby-class GetUniverse. SOCOM II uses the LobbyExt form |
+
+`ApplyGameListFilters` works the same way. The console's filters are logged as `SetGameListFilter0 …` lines;
+turn it on only once those lines match how you expect your rooms to be filtered.
 
 ## Cloud deployment
 

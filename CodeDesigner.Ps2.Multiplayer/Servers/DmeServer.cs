@@ -55,6 +55,13 @@ public class DmeServer : BaseMediusTcpServer
     public static DmeWorld CreateWorld(int mediusWorldId, int appId, int maxPlayers)
         => new(mediusWorldId, appId, maxPlayers);
 
+    /// <summary>Like <see cref="CreateWorld"/>, but null when all 255 world ids are in use.</summary>
+    public static DmeWorld? TryCreateWorld(int mediusWorldId, int appId, int maxPlayers)
+    {
+        try { return new DmeWorld(mediusWorldId, appId, maxPlayers); }
+        catch (InvalidOperationException) { return null; }
+    }
+
     // ── Connect (v108 hooks) ──────────────────────────────────────────────────
 
     protected override bool SendCryptKeyPeerAfterGame => true;
@@ -64,21 +71,28 @@ public class DmeServer : BaseMediusTcpServer
         MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
         var world = state.WorldId is int id ? DmeWorld.GetById(id) : null;
-        var slot  = world?.FindByAccessKey(state.AccessKey);
+        // TryBind refuses a second connection presenting a token whose slot is already connected: letting it
+        // rebind the slot meant the first connection's disconnect later removed the player now using it.
+        var slot  = world?.TryBind(state.AccessKey, state.ConnectionId);
         if (world == null || slot == null)
         {
             _log.LogWarning("[DME] Connect for world {World} with unknown access key '{Key}' ({Worlds})",
-                state.WorldId, state.AccessKey, string.Join(", ", DmeWorld.All));
+                state.WorldId, state.AccessKey.Length > 4 ? state.AccessKey[..4] + "…" : state.AccessKey, string.Join(", ", DmeWorld.All));
             return Task.FromResult<(ushort, ushort)?>(null);
         }
 
-        slot.IsConnected   = true;
         slot.MediusVersion = state.MediusVersion;
         slot.ScertId       = state.ScertId;
         if (state.ClientCryptKey.Length > 0) slot.PublicKey = state.ClientCryptKey;
         if (tcp.Client.RemoteEndPoint is System.Net.IPEndPoint ep) slot.IpAddress = ep.Address.MapToIPv4().ToString();
-        slot.Sender        = (type, payload) =>
-            SendPacketAsync(tcp, new ScertPacket { MessageType = type, Payload = payload }, state, ct);
+        slot.Bind(
+            (type, payload) => SendPacketAsync(tcp, new ScertPacket { MessageType = type, Payload = payload }, state, ct),
+            () =>
+            {
+                _log.LogWarning("[DME] Player {Id} in {World} fell {N} frames behind — disconnecting",
+                    slot.DmeId, world, DmeClientState.OutboxCapacity);
+                try { tcp.Close(); } catch { /* already gone */ }
+            });
 
         state.DmeWorldId         = world.WorldId;
         state.DmeClientIndex     = slot.DmeId;
@@ -116,11 +130,8 @@ public class DmeServer : BaseMediusTcpServer
             if (slot.AccountId != 0) _presence.LeftGame(slot.AccountId);
             _log.LogInformation("[DME] Player {Id} left {World}", slot.DmeId, world);
 
-            if (world.Clients.IsEmpty && world.SelfDestructFlag)
-            {
-                world.Destroy();
+            if (world.SelfDestructFlag && world.TryDestroyIfEmpty())
                 _log.LogInformation("[DME] {World} destroyed (empty + self-destruct)", world);
-            }
         }
         return Task.CompletedTask;
     }
@@ -183,9 +194,13 @@ public class DmeServer : BaseMediusTcpServer
                 int count = payload[0];
                 int dataOffset = 1 + count * 2;
                 if (payload.Length < dataOffset) break;
-                var targets = new List<int>(count);
+                // Each target gets one copy: repeated ids (or the sender itself) would multiply the relay.
+                var targets = new HashSet<int>(count);
                 for (int i = 0; i < count; i++)
-                    targets.Add(payload[1 + i * 2] | (payload[2 + i * 2] << 8));
+                {
+                    int target = payload[1 + i * 2] | (payload[2 + i * 2] << 8);
+                    if (target != slot.DmeId) targets.Add(target);
+                }
                 world.SendAppList(slot, targets, payload[dataOffset..]);
                 break;
             }
@@ -210,6 +225,8 @@ public class DmeServer : BaseMediusTcpServer
     {
         if (state.DmeWorldId is not int worldId || state.DmeClientIndex is not int index) return null;
         var world = DmeWorld.GetById(worldId);
-        return world != null && world.Clients.TryGetValue(index, out var slot) ? slot : null;
+        // Match the connection too: after a slot index is reused, a stale connection must not find the new player.
+        return world != null && world.Clients.TryGetValue(index, out var slot) && slot.BoundConnectionId == state.ConnectionId
+            ? slot : null;
     }
 }

@@ -43,9 +43,13 @@ public abstract class BaseMediusTcpServer
     /// landing mid-way through a community-batch write) and the client receives a corrupted packet and
     /// instantly disconnects — intermittently, depending on timing. Every send acquires this gate so only
     /// one write is ever in flight per connection. (RC4 is stateless per packet — see the decrypt path —
-    /// so only the raw write needs serializing.)
+    /// so only the raw write needs serializing.) Keyed weakly, so a gate goes away with its connection even if a
+    /// late send touches it after the connection was cleaned up.
     /// </summary>
-    private readonly ConcurrentDictionary<TcpClient, SemaphoreSlim> _sendGates = new();
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<TcpClient, SemaphoreSlim> _sendGates = new();
+
+    /// <summary>A write that can't complete in this time means the peer stopped reading; the connection is dropped.</summary>
+    private static readonly TimeSpan SendTimeout = TimeSpan.FromSeconds(30);
 
     protected BaseMediusTcpServer(ILogger log, MultiplayerConfig config)
     {
@@ -127,24 +131,87 @@ public abstract class BaseMediusTcpServer
         Clients.Clear();
     }
 
+    /// <summary>Wait (up to <paramref name="timeout"/>) for every connection's handler to finish its cleanup.</summary>
+    public Task WaitForConnectionsAsync(TimeSpan timeout)
+        => Task.WhenAny(Task.WhenAll(_connections.Keys), Task.Delay(timeout));
+
     // -------------------------------------------------------------------------
     // Accept loop
     // -------------------------------------------------------------------------
 
+    /// <summary>Running connection handlers, so shutdown can wait for their cleanup.</summary>
+    private readonly ConcurrentDictionary<Task, byte> _connections = new();
+
+    /// <summary>Open connections per remote IP (<see cref="MultiplayerConfig.MaxConnectionsPerIp"/>).</summary>
+    private readonly ConcurrentDictionary<IPAddress, int> _connectionsPerIp = new();
+
     private async Task AcceptLoopAsync(CancellationToken ct)
     {
+        int failures = 0;
         while (!ct.IsCancellationRequested)
         {
+            TcpClient tcp;
             try
             {
-                var tcp = await _listener!.AcceptTcpClientAsync(ct);
-                _ = HandleClientAsync(tcp, ct);
+                tcp = await _listener!.AcceptTcpClientAsync(ct);
+                failures = 0;
             }
             catch (OperationCanceledException) { break; }
+            catch (ObjectDisposedException) { break; }   // listener stopped
             catch (Exception ex)
             {
                 _log.LogError(ex, "[{Name}] Accept error", ServerName);
+                // A persistent error (e.g. out of file handles) would otherwise spin this loop flat out.
+                try { await Task.Delay(Math.Min(2000, 50 << Math.Min(failures++, 6)), ct); }
+                catch (OperationCanceledException) { break; }
+                continue;
             }
+
+            if (!TryAdmit(tcp, out var ip))
+            {
+                try { tcp.Close(); } catch { /* already gone */ }
+                continue;
+            }
+
+            var handler = HandleClientAsync(tcp, ip, ct);
+            _connections[handler] = 0;
+            _ = handler.ContinueWith(t => _connections.TryRemove(t, out _), TaskScheduler.Default);
+        }
+    }
+
+    /// <summary>Apply <see cref="MultiplayerConfig.MaxClients"/> and <see cref="MultiplayerConfig.MaxConnectionsPerIp"/>.</summary>
+    private bool TryAdmit(TcpClient tcp, out IPAddress? ip)
+    {
+        ip = null;
+        try { ip = (tcp.Client.RemoteEndPoint as IPEndPoint)?.Address.MapToIPv4(); }
+        catch (Exception) { return false; }   // reset before we got to it
+
+        if (_config.MaxClients > 0 && Clients.Count >= _config.MaxClients)
+        {
+            _log.LogWarning("[{Name}] Refusing {Ip}: server full ({Max} connections)", ServerName, ip, _config.MaxClients);
+            ip = null;
+            return false;
+        }
+
+        if (ip == null || _config.MaxConnectionsPerIp <= 0) return true;
+        int open = _connectionsPerIp.AddOrUpdate(ip, 1, (_, n) => n + 1);
+        if (open <= _config.MaxConnectionsPerIp) return true;
+
+        ReleaseIp(ip);
+        _log.LogWarning("[{Name}] Refusing {Ip}: {Max} connections already open from that address",
+            ServerName, ip, _config.MaxConnectionsPerIp);
+        ip = null;
+        return false;
+    }
+
+    private void ReleaseIp(IPAddress? ip)
+    {
+        if (ip == null || _config.MaxConnectionsPerIp <= 0) return;
+        while (_connectionsPerIp.TryGetValue(ip, out int n))
+        {
+            if (n <= 1 ? _connectionsPerIp.TryRemove(new KeyValuePair<IPAddress, int>(ip, n))
+                       : _connectionsPerIp.TryUpdate(ip, n - 1, n))
+                return;
         }
     }
 
@@ -174,98 +241,158 @@ public abstract class BaseMediusTcpServer
     // Per-client read loop
     // -------------------------------------------------------------------------
 
-    private async Task HandleClientAsync(TcpClient tcp, CancellationToken ct)
+    private async Task HandleClientAsync(TcpClient tcp, IPAddress? ip, CancellationToken ct)
     {
-        tcp.NoDelay = true;
-
-        var state = new MediusClientState
-        {
-            RemoteEndpoint = tcp.Client.RemoteEndPoint?.ToString() ?? "?",
-            Timeout        = TimeSpan.FromSeconds(60),
-        };
-
-        Clients[state.ConnectionId] = (state, tcp);
-        _log.LogInformation("[{Name}] Client connected: {Ep} ({Id})", ServerName, state.RemoteEndpoint, state.ConnectionId);
-
-        await OnClientConnectedAsync(state, tcp);
-
-        // Server-initiated keepalive. SOCOM II's idle timer fires after a stretch
-        // of server silence and pops "Disconnected from Network" on the persona
-        // screen mid-typing. RunKeepAliveLoopAsync pings the client with the exact
-        // CLIENT_ECHO (0x05, payload 0xA5, RcClientSession) heartbeat the 2012 retail
-        // MAS server used — see ScertPacket.CreateClientEcho. The earlier empty
-        // SERVER_ECHO (0x1F) keepalive was the wrong message type and itself caused
-        // the disconnect the moment it fired. The cancellation token kills the loop
-        // the moment HandleClientAsync exits.
-        using var keepAliveCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        _ = RunKeepAliveLoopAsync(state, tcp, keepAliveCts.Token);
-
-        var stream = tcp.GetStream();
-        var buffer = new byte[8192];
-        var pending = new List<byte>(8192);
+        // Cancelled when this handler exits: stops the keepalive and timeout loops at once.
+        using var connCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        MediusClientState? state = null;
+        int unparsed = 0;
 
         try
         {
-            while (!ct.IsCancellationRequested && tcp.Connected)
+            tcp.NoDelay = true;
+            state = new MediusClientState
             {
-                int read = await stream.ReadAsync(buffer, ct);
-                if (read == 0) break;
+                RemoteEndpoint = tcp.Client.RemoteEndPoint?.ToString() ?? "?",
+                Timeout        = _config.IdleTimeoutSeconds > 0 ? TimeSpan.FromSeconds(_config.IdleTimeoutSeconds) : Timeout.InfiniteTimeSpan,
+            };
 
-                state.Touch();
-                _log.LogDebug("[{Name}] RAW recv {Len} bytes: {Hex}", ServerName, read,
-                    BitConverter.ToString(buffer, 0, read).Replace("-", " "));
-                pending.AddRange(buffer[..read]);
+            Clients[state.ConnectionId] = (state, tcp);
+            _log.LogInformation("[{Name}] Client connected: {Ep} ({Id})", ServerName, state.RemoteEndpoint, state.ConnectionId);
 
-                // Parse as many complete packets as possible
-                while (true)
-                {
-                    var pendingArray = pending.ToArray();
-                    var packet = ScertPacket.TryRead(pendingArray, 0, pendingArray.Length, out int consumed);
-                    if (packet == null || consumed == 0) break;
+            await OnClientConnectedAsync(state, tcp);
 
-                    pending.RemoveRange(0, consumed);
+            // Server-initiated keepalive. SOCOM II's idle timer fires after a stretch
+            // of server silence and pops "Disconnected from Network" on the persona
+            // screen mid-typing. RunKeepAliveLoopAsync pings the client with the exact
+            // CLIENT_ECHO (0x05, payload 0xA5, RcClientSession) heartbeat the 2012 retail
+            // MAS server used — see ScertPacket.CreateClientEcho. The earlier empty
+            // SERVER_ECHO (0x1F) keepalive was the wrong message type and itself caused
+            // the disconnect the moment it fired.
+            _ = RunKeepAliveLoopAsync(state, tcp, connCts.Token);
+            _ = RunTimeoutWatchdogAsync(state, tcp, connCts.Token);
 
-                    // Decrypt payload in-place using per-packet stateless PS2 RC4.
-                    // Only applies AFTER the key exchange completes (CLIENT_CRYPTKEY_PUBLIC
-                    // itself is RSA-encrypted, not RC4 — don't decrypt it).
-                    if (packet.IsEncrypted && packet.Hash != null && state.CryptKeyReceived)
-                    {
-                        int clear = ClearPrefixLength(packet.MessageType, packet.Payload.Length);
-                        PS2_RC4.Decrypt(state.SessionRc4Key, packet.Hash, packet.Payload.AsSpan(clear));
-                    }
-
-                    // Isolate handler faults: a single malformed message must not tear down
-                    // the connection (and drop every message queued behind it). Log and move on.
-                    try
-                    {
-                        await DispatchPacketAsync(packet, state, tcp, ct);
-                    }
-                    catch (Exception ex) when (!ct.IsCancellationRequested)
-                    {
-                        _log.LogWarning("[{Name}] Handler error for {Type} from {Id}: {Msg}",
-                            ServerName, packet.MessageType, state.ConnectionId, ex.Message);
-                    }
-                }
-            }
+            unparsed = await ReadLoopAsync(state, tcp, connCts.Token);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            _log.LogWarning("[{Name}] Client {Id} read error: {Msg}", ServerName, state.ConnectionId, ex.Message);
+            _log.LogWarning("[{Name}] Client {Id} read error: {Msg}", ServerName, state?.ConnectionId ?? "?", ex.Message);
         }
         finally
         {
-            if (pending.Count > 0)
-                _log.LogWarning("[{Name}] Client {Id} disconnected with {N} unparsed bytes: {Hex}",
-                    ServerName, state.ConnectionId, pending.Count,
-                    BitConverter.ToString(pending.ToArray()).Replace("-", " "));
-            Clients.TryRemove(state.ConnectionId, out _);
-            if (_sendGates.TryRemove(tcp, out var sendGate)) sendGate.Dispose();
-            await OnClientDisconnectedAsync(state);
-            tcp.Close();
-            _log.LogInformation("[{Name}] Client disconnected: {Id}", ServerName, state.ConnectionId);
+            connCts.Cancel();
+            ReleaseIp(ip);
+            // Close first: once the socket is down no send can start on it while the hooks below run.
+            try { tcp.Close(); } catch { /* already gone */ }
+
+            if (state != null)
+            {
+                if (unparsed > 0)
+                    _log.LogWarning("[{Name}] Client {Id} disconnected with {N} unparsed bytes", ServerName, state.ConnectionId, unparsed);
+                Clients.TryRemove(state.ConnectionId, out _);
+                try { await OnClientDisconnectedAsync(state); }
+                catch (Exception ex) { _log.LogError(ex, "[{Name}] Disconnect cleanup failed for {Id}", ServerName, state.ConnectionId); }
+                _log.LogInformation("[{Name}] Client disconnected: {Id}", ServerName, state.ConnectionId);
+            }
         }
     }
+
+    /// <summary>
+    /// Read and dispatch packets until the client disconnects. Returns the number of bytes left over that never
+    /// formed a complete packet.
+    /// </summary>
+    private async Task<int> ReadLoopAsync(MediusClientState state, TcpClient tcp, CancellationToken ct)
+    {
+        var stream = tcp.GetStream();
+        // Holds at most one partial frame (< 64 KiB) plus one read, so it stays bounded.
+        var buf = new byte[16384];
+        int len = 0;
+
+        while (!ct.IsCancellationRequested && tcp.Connected)
+        {
+            if (buf.Length - len < 8192) Array.Resize(ref buf, Math.Max(buf.Length * 2, len + 8192));
+            int read = await stream.ReadAsync(buf.AsMemory(len), ct);
+            if (read == 0) break;
+
+            state.Touch();
+            if (_log.IsEnabled(LogLevel.Debug))
+                _log.LogDebug("[{Name}] RAW recv {Len} bytes: {Hex}", ServerName, read, Hex(buf.AsSpan(len, read)));
+            len += read;
+
+            // Parse as many complete packets as possible
+            int off = 0;
+            while (true)
+            {
+                var packet = ScertPacket.TryRead(buf, off, len - off, out int consumed);
+                if (packet == null || consumed == 0) break;
+                off += consumed;
+
+                // Decrypt payload in-place using per-packet stateless PS2 RC4.
+                // Only applies AFTER the key exchange completes (CLIENT_CRYPTKEY_PUBLIC
+                // itself is RSA-encrypted, not RC4 — don't decrypt it).
+                if (packet.IsEncrypted && packet.Hash != null && state.CryptKeyReceived)
+                {
+                    int clear = ClearPrefixLength(packet.MessageType, packet.Payload.Length);
+                    PS2_RC4.Decrypt(state.SessionRc4Key, packet.Hash, packet.Payload.AsSpan(clear));
+                }
+
+                // Isolate handler faults: a single malformed message must not tear down
+                // the connection (and drop every message queued behind it). Log and move on.
+                try
+                {
+                    await DispatchPacketAsync(packet, state, tcp, ct);
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    _log.LogWarning("[{Name}] Handler error for {Type} from {Id}: {Msg}",
+                        ServerName, packet.MessageType, state.ConnectionId, ex.Message);
+                }
+            }
+
+            if (off > 0)
+            {
+                Buffer.BlockCopy(buf, off, buf, 0, len - off);
+                len -= off;
+            }
+        }
+        return len;
+    }
+
+    /// <summary>
+    /// Close connections that never finish the handshake (<see cref="MultiplayerConfig.ClientTimeoutSeconds"/>) or
+    /// go silent once established (<see cref="MultiplayerConfig.IdleTimeoutSeconds"/>).
+    /// </summary>
+    private async Task RunTimeoutWatchdogAsync(MediusClientState state, TcpClient tcp, CancellationToken ct)
+    {
+        var handshake = _config.ClientTimeoutSeconds > 0 ? TimeSpan.FromSeconds(_config.ClientTimeoutSeconds) : (TimeSpan?)null;
+        bool idle     = _config.IdleTimeoutSeconds > 0;
+        if (handshake == null && !idle) return;
+
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(5), ct);
+
+                string? reason = null;
+                if (!state.IsSessionEstablished && handshake is TimeSpan h && DateTime.UtcNow - state.ConnectedAt > h)
+                    reason = $"no handshake within {h.TotalSeconds:0}s";
+                else if (idle && state.IsTimedOut)
+                    reason = $"idle for {state.Timeout.TotalSeconds:0}s";
+
+                if (reason == null) continue;
+                _log.LogInformation("[{Name}] Closing {Id} ({Ep}): {Reason}", ServerName, state.ConnectionId, state.RemoteEndpoint, reason);
+                try { tcp.Close(); } catch { /* already gone */ }
+                return;
+            }
+        }
+        catch (OperationCanceledException) { /* connection ended */ }
+    }
+
+    /// <summary>Space-separated hex for debug logs. Callers check the log level first so it's only built when needed.</summary>
+    protected static string Hex(ReadOnlySpan<byte> data)
+        => string.Join(' ', Convert.ToHexString(data).Chunk(2).Select(c => new string(c)));
 
     // -------------------------------------------------------------------------
     // Packet dispatch
@@ -273,9 +400,9 @@ public abstract class BaseMediusTcpServer
 
     private async Task DispatchPacketAsync(ScertPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
-        _log.LogDebug("[{Name}] <- {Id} {Type} ({Len} bytes) {Hex}",
-            ServerName, state.ConnectionId, packet.MessageType, packet.Payload.Length,
-            BitConverter.ToString(packet.Payload).Replace("-", " "));
+        if (_log.IsEnabled(LogLevel.Debug))
+            _log.LogDebug("[{Name}] <- {Id} {Type} ({Len} bytes) {Hex}",
+                ServerName, state.ConnectionId, packet.MessageType, packet.Payload.Length, Hex(packet.Payload));
 
         switch (packet.MessageType)
         {
@@ -316,9 +443,6 @@ public abstract class BaseMediusTcpServer
                 break;
 
             case RT_MSG_TYPE.RT_MSG_CLIENT_APP_TOSERVER:
-                _log.LogInformation("[{Name}] CLIENT_APP_TOSERVER ({Len} bytes): {Hex}",
-                    ServerName, packet.Payload.Length,
-                    BitConverter.ToString(packet.Payload).Replace("-", " "));
                 var mp = MediusPacket.Parse(packet.Payload);
                 if (mp != null)
                     await HandleMediusMessageAsync(mp, state, tcp, ct);
@@ -328,9 +452,7 @@ public abstract class BaseMediusTcpServer
 
             case RT_MSG_TYPE.RT_MSG_SERVER_CHEAT_QUERY:
                 // PS2 sends its anti-cheat response using the same 0x1D type byte.
-                _log.LogInformation("[{Name}] <- CHEAT_QUERY response ({Len} bytes): {Hex}",
-                    ServerName, packet.Payload.Length,
-                    BitConverter.ToString(packet.Payload).Replace("-", " "));
+                _log.LogDebug("[{Name}] <- CHEAT_QUERY response ({Len} bytes)", ServerName, packet.Payload.Length);
                 await HandleCheatQueryResponseAsync(packet, state, tcp, ct);
                 break;
 
@@ -350,9 +472,8 @@ public abstract class BaseMediusTcpServer
                 break;
 
             default:
-                _log.LogInformation("[{Name}] Unhandled SCERT type {Type} payload={Hex}",
-                    ServerName, packet.MessageType,
-                    BitConverter.ToString(packet.Payload).Replace("-", " "));
+                _log.LogInformation("[{Name}] Unhandled SCERT type {Type} ({Len} bytes)",
+                    ServerName, packet.MessageType, packet.Payload.Length);
                 break;
         }
     }
@@ -387,10 +508,15 @@ public abstract class BaseMediusTcpServer
         // The PS2 sets 0x80 flag + hash for authentication but does not apply RC4 to this
         // packet (it has no session key yet).  Treat payload as RSA ciphertext directly.
 
-        _log.LogDebug("[{Name}] CLIENT_CRYPTKEY_PUBLIC ({Len} bytes) hash={HashHex} payload={Hex}",
-            ServerName, packet.Payload.Length,
-            packet.Hash != null ? BitConverter.ToString(packet.Hash).Replace("-", " ") : "null",
-            BitConverter.ToString(packet.Payload).Replace("-", " "));
+        // The client's key is a 512-bit RSA ciphertext. Anything else (an empty or short payload, or a key that
+        // decrypts to a tiny modulus) can't key a session — and a tiny modulus used to hang key generation.
+        if (packet.Payload.Length != 64)
+        {
+            _log.LogWarning("[{Name}] CLIENT_CRYPTKEY_PUBLIC from {Ep} is {Len} bytes, expected 64 — closing",
+                ServerName, state.RemoteEndpoint, packet.Payload.Length);
+            tcp.Close();
+            return;
+        }
 
         // The 64-byte payload is N_ps2 RSA-encrypted with Horizon's server public key
         // (N_server hardcoded in the PS2 game binary — independent of SERVER_HELLO content).
@@ -404,16 +530,19 @@ public abstract class BaseMediusTcpServer
             // This can happen if the deployed binary didn't parse Hash correctly (stale build).
             // In that case treat the payload as plaintext N_ps2 as a fallback.
             var rawDecrypted = Ps2Rsa.ServerKey.DecryptRaw(packet.Payload);
-            _log.LogWarning("[{Name}] CLIENT_CRYPTKEY_PUBLIC: hash mismatch. hash={H} rawDecrypt={D}",
-                ServerName,
-                BitConverter.ToString(hashForDecrypt).Replace("-", " "),
-                BitConverter.ToString(rawDecrypted).Replace("-", " "));
+            _log.LogWarning("[{Name}] CLIENT_CRYPTKEY_PUBLIC: hash mismatch (hash={H}); using the raw decrypt",
+                ServerName, Convert.ToHexString(hashForDecrypt));
             // Use the RSA-decrypted bytes even without hash verification.
             ps2NBytes = rawDecrypted;
         }
 
-        _log.LogDebug("[{Name}] N_ps2 (LE)={Hex}", ServerName,
-            BitConverter.ToString(ps2NBytes).Replace("-", " "));
+        if (!Ps2Rsa.IsUsableClientModulus(ps2NBytes))
+        {
+            _log.LogWarning("[{Name}] CLIENT_CRYPTKEY_PUBLIC from {Ep} carries an unusable RSA key — closing",
+                ServerName, state.RemoteEndpoint);
+            tcp.Close();
+            return;
+        }
 
         state.ClientCryptKey = ps2NBytes;
         state.ClientRsa      = Ps2Rsa.FromClientPublicKey(ps2NBytes);
@@ -422,15 +551,9 @@ public abstract class BaseMediusTcpServer
         // so RSA encryption m^E mod N_ps2 is a bijection the PS2 can invert with D_ps2.
         state.SessionRc4Key = Ps2Rsa.GenerateMessageLessThan(state.ClientRsa.N);
 
-        _log.LogDebug("[{Name}] SessionRc4Key={Hex}", ServerName,
-            BitConverter.ToString(state.SessionRc4Key).Replace("-", " "));
-
         // Send CRYPTKEY_PEER with the raw session key (no RSA encryption, no 0x80 flag).
         // The PS2 SCERT overlay (old proto, type 0x13 without 0x80) uses the payload bytes
         // directly as its RC4 working key — it does NOT apply RSA decryption for this path.
-        _log.LogDebug("[{Name}] CRYPTKEY_PEER payload={Hex}", ServerName,
-            BitConverter.ToString(state.SessionRc4Key).Replace("-", " "));
-
         await SendPacketAsync(tcp, ScertPacket.CreateCryptKeyPeer(state.SessionRc4Key), ct);
         // CRYPTKEY_GAME is sent later, after the PS2 responds with its encrypted CLIENT_CONNECT_TCP.
     }
@@ -482,11 +605,29 @@ public abstract class BaseMediusTcpServer
         _log.LogInformation("[{Name}] CLIENT_CONNECT_TCP (encrypted) AppId={AppId} ver={Ver} world=0x{World:X}",
             ServerName, state.AppId, state.MediusVersion, state.WorldId ?? 0);
 
+        if (_config.AllowedAppIds.Count > 0 && !_config.AllowedAppIds.Contains(state.AppId))
+        {
+            _log.LogWarning("[{Name}] Refusing {Ep}: AppId {AppId} is not in AllowedAppIds [{Allowed}]",
+                ServerName, state.RemoteEndpoint, state.AppId, string.Join(", ", _config.AllowedAppIds));
+            await SendPacketAsync(tcp, ScertPacket.CreateForcedDisconnect(1), state, ct);
+            tcp.Close();
+            return;
+        }
+
         state.ScertId = Interlocked.Increment(ref _scertIdCounter);
         var clientIp = (tcp.Client.RemoteEndPoint as IPEndPoint)?.Address;
 
         if (state.MediusVersion > 108)
         {
+            // The new-protocol path never runs OnOldProtoConnectAsync, so a server that only accepts bound
+            // connections (DME) can't accept it.
+            if (RejectUnboundOldProtoConnect)
+            {
+                _log.LogWarning("[{Name}] CLIENT_CONNECT_TCP v{Ver} rejected: only v108 connects can be bound", ServerName, state.MediusVersion);
+                await SendPacketAsync(tcp, ScertPacket.CreateForcedDisconnect(1), state, ct);
+                tcp.Close();
+                return;
+            }
             // New protocol: send SERVER_CONNECT_REQUIRE, client responds with CLIENT_CONNECT_READY_REQUIRE
             await SendPacketAsync(tcp, ScertPacket.CreateConnectRequire(), ct);
         }
@@ -659,7 +800,7 @@ public abstract class BaseMediusTcpServer
 
         // Serialize all writes on this connection so the keepalive loop and the main loop can't
         // interleave bytes on the wire (= corrupted packet → instant client disconnect).
-        var gate = _sendGates.GetOrAdd(tcp, static _ => new SemaphoreSlim(1, 1));
+        var gate = _sendGates.GetValue(tcp, static _ => new SemaphoreSlim(1, 1));
         try { await gate.WaitAsync(ct); }
         catch (OperationCanceledException) { return; }
 
@@ -667,8 +808,16 @@ public abstract class BaseMediusTcpServer
         {
             var data = packet.Serialize();
             var stream = tcp.GetStream();
-            await stream.WriteAsync(data, ct);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(SendTimeout);
+            await stream.WriteAsync(data, timeout.Token);
             _log.LogDebug("[{Name}] -> {Type} ({Len} bytes)", ServerName, packet.MessageType, packet.Payload.Length);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            _log.LogWarning("[{Name}] Send to {Ep} timed out after {S}s — closing", ServerName,
+                SafeRemote(tcp), SendTimeout.TotalSeconds);
+            try { tcp.Close(); } catch { /* already gone */ }
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -684,9 +833,16 @@ public abstract class BaseMediusTcpServer
     /// Send a SCERT packet, RC4-encrypting the payload with <paramref name="context"/>.
     /// Packets whose <see cref="ScertPacket.Hash"/> is already set are sent as-is.
     /// </summary>
+    private static string SafeRemote(TcpClient tcp)
+    {
+        try { return tcp.Client?.RemoteEndPoint?.ToString() ?? "?"; }
+        catch (ObjectDisposedException) { return "?"; }
+    }
+
     protected Task SendPacketAsync(TcpClient tcp, ScertPacket packet, MediusClientState state, CipherContext context, CancellationToken ct)
     {
-        if (state.SessionRc4Key != null && packet.Hash == null)
+        // Before the key exchange SessionRc4Key is all zeros — "encrypting" with it would only produce garbage.
+        if (state.CryptKeyReceived && packet.Hash == null)
         {
             int clear = ClearPrefixLength(packet.MessageType, packet.Payload.Length);
             PS2_RC4.Encrypt(state.SessionRc4Key, context,
@@ -934,7 +1090,7 @@ public abstract class BaseMediusTcpServer
         state.LastProactiveEchoAt = DateTime.UtcNow;
         var salt = new byte[16];
         Random.Shared.NextBytes(salt);
-        var seq = state.CheatSeq++;
+        var seq = state.NextCheatSeq();
         await SendPacketAsync(tcp, ScertPacket.CreateSaltedCheatQuery(seq, CheatQueryAddress, CheatQueryLength, salt), state, ct);
         _log.LogDebug("[{Name}] -> SERVER_CHEAT_QUERY salted seq={Seq} (lobby anti-cheat) to {Id}", ServerName, seq, state.ConnectionId);
     }

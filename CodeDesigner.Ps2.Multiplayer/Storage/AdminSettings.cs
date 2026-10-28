@@ -178,7 +178,7 @@ public sealed class AdminSettings : IDisposable
     private void EnsureDefault<T>(string file, T value)
     {
         var path = Path.Combine(Directory, file);
-        if (!File.Exists(path)) File.WriteAllText(path, JsonSerializer.Serialize(value, Json));
+        if (!File.Exists(path)) AtomicFile.WriteAllText(path, JsonSerializer.Serialize(value, Json));
     }
 
     /// <summary>Add an account ban and persist bans.json (the reload then kicks the player).</summary>
@@ -189,7 +189,7 @@ public sealed class AdminSettings : IDisposable
             var bans = TryLoad<BanList>(BansFile) ?? Bans;
             if (bans.FindAccount(name) != null) return;
             bans.Accounts.Add(new BanEntry { Name = name, Reason = reason });
-            File.WriteAllText(Path.Combine(Directory, BansFile), JsonSerializer.Serialize(bans, Json));
+            AtomicFile.WriteAllText(Path.Combine(Directory, BansFile), JsonSerializer.Serialize(bans, Json));
         }
         _reloadTimer.Change(100, Timeout.Infinite);
     }

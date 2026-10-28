@@ -207,7 +207,9 @@ public class MuisServer : BaseMediusTcpServer
     {
         _log.LogInformation("[MUIS] Sending universe info - MAS={Ip}:{Port}", _config.ServerIp, _config.MasPort);
 
-        var payload = BuildLegacyUniverseStatusPayload(msgId);
+        var payload = !useLobbyExt && _config.WireFixes.MuisLegacyGetUniverse
+            ? BuildLegacyGetUniverseResponsePayload(msgId)   // the 0x120-byte Lobby GetUniverseResponse body
+            : BuildLegacyUniverseStatusPayload(msgId);
 
         MediusPacket response;
         if (useLobbyExt)

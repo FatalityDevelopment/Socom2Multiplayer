@@ -5,7 +5,7 @@ public class MediusAccount
 {
     public int    AccountId       { get; set; }
     public string AccountName     { get; set; } = string.Empty;
-    public string PasswordHash    { get; set; } = string.Empty;  // SHA-1 hex or plain for dev
+    public string PasswordHash    { get; set; } = string.Empty;  // PasswordHasher format (legacy: SHA-1 hex); empty = no password
     public string Stats           { get; set; } = string.Empty;
     public bool   IsBanned        { get; set; }
     public DateTime CreatedAt     { get; set; } = DateTime.UtcNow;
@@ -22,6 +22,11 @@ public class MediusAccount
 
     /// <summary>Buddy (friends) list — account ids.</summary>
     public List<int> Buddies      { get; set; } = new();
+
+    /// <summary>
+    /// Accounts that added this one as a friend and are waiting for it to add them back (GetBuddyInvitations).
+    /// </summary>
+    public List<int> BuddyRequestsFrom { get; set; } = new();
 
     /// <summary>Ignore list — account ids.</summary>
     public List<int> Ignores      { get; set; } = new();

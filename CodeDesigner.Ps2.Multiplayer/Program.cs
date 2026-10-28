@@ -33,14 +33,11 @@ builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
 if (!logFile.Equals("none", StringComparison.OrdinalIgnoreCase))
     builder.Logging.AddProvider(new FileLoggerProvider(logFile));
-builder.Logging.SetMinimumLevel(LogLevel.Debug);
+// Information by default; Logging__LogLevel__Default=Debug (compose: LOG_LEVEL=Debug) adds full packet hex.
+builder.Logging.SetMinimumLevel(LogLevel.Information);
 
-// Load server config
-var serverConfig = new MultiplayerConfig();
-builder.Configuration.GetSection("Online").Bind(serverConfig);
-// Also accept the legacy "Medius" section so old config.json files still work
-if (serverConfig.ServerIp == "127.0.0.1" && builder.Configuration.GetSection("Medius").Exists())
-    builder.Configuration.GetSection("Medius").Bind(serverConfig);
+// Load server config ("Online", or the legacy "Medius" section so old config.json files still work)
+var serverConfig = MultiplayerConfig.Load(builder.Configuration);
 
 builder.Services.AddSingleton(serverConfig);
 

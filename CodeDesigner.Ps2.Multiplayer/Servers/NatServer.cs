@@ -37,7 +37,23 @@ public class NatServer
     public Task StartAsync(CancellationToken ct)
     {
         _ct  = ct;
-        _udp = new UdpClient(new IPEndPoint(IPAddress.Parse(_config.BindAddress), _config.NatPort));
+        if (_config.NatPort == 0)
+        {
+            _log.LogInformation("[NAT] Port = 0 — disabled, not listening");
+            return Task.CompletedTask;
+        }
+        try
+        {
+            _udp = new UdpClient(new IPEndPoint(IPAddress.Parse(_config.BindAddress), _config.NatPort));
+        }
+        catch (SocketException ex)
+        {
+            // The NAT helper is optional; the rest of the server can run without it.
+            _log.LogError("[NAT] Cannot bind {Addr}:{Port} (UDP): {Msg} — NAT helper disabled",
+                _config.BindAddress, _config.NatPort, ex.Message);
+            return Task.CompletedTask;
+        }
+        UdpSockets.IgnoreConnectionResets(_udp);
         _log.LogInformation("[NAT] Listening on {Addr}:{Port} (UDP)", _config.BindAddress, _config.NatPort);
         _ = ReceiveLoopAsync(ct);
         return Task.CompletedTask;

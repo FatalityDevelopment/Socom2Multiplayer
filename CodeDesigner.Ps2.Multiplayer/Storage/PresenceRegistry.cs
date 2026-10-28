@@ -22,12 +22,20 @@ public class PresenceRegistry
 
     private readonly ConcurrentDictionary<int, Entry> _online = new();
 
+    /// <summary>
+    /// Serialises adding and removing entries. With a per-entry lock, a Connected that fetched an entry just as a
+    /// Disconnected removed it would count the connection on an orphaned entry, and a live player showed offline.
+    /// (Room hops disconnect and reconnect back to back, so that window was hit.)
+    /// </summary>
+    private readonly object _gate = new();
+
     /// <summary>An MLS connection for this account came up (community screen or a briefing room).</summary>
     public void Connected(int accountId, int lobbyWorldId, string lobbyName)
     {
-        var e = _online.GetOrAdd(accountId, _ => new Entry());
-        lock (e)
+        lock (_gate)
         {
+            var e = _online.GetOrAdd(accountId, _ => new Entry());
+            e.IsVirtual = false;   // a real console now owns this account
             e.Connections++;
             e.State = new Presence(MediusPlayerStatus.MediusPlayerInChatWorld, lobbyWorldId, lobbyName, 0, "");
         }
@@ -36,10 +44,9 @@ public class PresenceRegistry
     /// <summary>An MLS connection for this account closed; the account is offline once none remain.</summary>
     public void Disconnected(int accountId)
     {
-        if (!_online.TryGetValue(accountId, out var e)) return;
-        lock (e)
+        lock (_gate)
         {
-            if (e.IsVirtual) return;
+            if (!_online.TryGetValue(accountId, out var e) || e.IsVirtual) return;
             if (--e.Connections <= 0) _online.TryRemove(accountId, out _);
         }
     }
@@ -50,9 +57,9 @@ public class PresenceRegistry
     /// </summary>
     public void AddVirtual(int accountId, int lobbyWorldId, string lobbyName)
     {
-        var e = _online.GetOrAdd(accountId, _ => new Entry());
-        lock (e)
+        lock (_gate)
         {
+            var e = _online.GetOrAdd(accountId, _ => new Entry());
             e.IsVirtual = true;
             e.State = new Presence(MediusPlayerStatus.MediusPlayerInChatWorld, lobbyWorldId, lobbyName, 0, "");
         }
@@ -61,10 +68,9 @@ public class PresenceRegistry
     /// <summary>Remove a virtual player. False when the account is not a virtual player.</summary>
     public bool RemoveVirtual(int accountId)
     {
-        if (!_online.TryGetValue(accountId, out var e)) return false;
-        lock (e)
+        lock (_gate)
         {
-            if (!e.IsVirtual) return false;
+            if (!_online.TryGetValue(accountId, out var e) || !e.IsVirtual) return false;
             return _online.TryRemove(accountId, out _);
         }
     }
@@ -77,14 +83,16 @@ public class PresenceRegistry
 
     public void JoinedGame(int accountId, int gameWorldId, string gameName)
     {
-        if (!_online.TryGetValue(accountId, out var e)) return;
-        lock (e) e.State = e.State with { Status = MediusPlayerStatus.MediusPlayerInGameWorld, GameWorldId = gameWorldId, GameName = gameName };
+        lock (_gate)
+            if (_online.TryGetValue(accountId, out var e))
+                e.State = e.State with { Status = MediusPlayerStatus.MediusPlayerInGameWorld, GameWorldId = gameWorldId, GameName = gameName };
     }
 
     public void LeftGame(int accountId)
     {
-        if (!_online.TryGetValue(accountId, out var e)) return;
-        lock (e) e.State = e.State with { Status = MediusPlayerStatus.MediusPlayerInChatWorld, GameWorldId = 0, GameName = "" };
+        lock (_gate)
+            if (_online.TryGetValue(accountId, out var e))
+                e.State = e.State with { Status = MediusPlayerStatus.MediusPlayerInChatWorld, GameWorldId = 0, GameName = "" };
     }
 
     /// <summary>Current presence, or null when the account is offline.</summary>

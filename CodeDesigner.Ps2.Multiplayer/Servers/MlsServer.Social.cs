@@ -69,6 +69,7 @@ public partial class MlsServer
             case MediusLobbyMessageId.RevokeClanInvitation:        await HandleRevokeClanInvitationAsync(packet, state, tcp, ct); return true;
             case MediusLobbyMessageId.GetClanInvitationsSent:      await HandleGetClanInvitationsSentAsync(packet, state, tcp, ct); return true;
             case MediusLobbyMessageId.GetClanMemberList_ExtraInfo: await HandleGetClanMemberListAsync(packet, state, tcp, ct); return true;
+            case MediusLobbyMessageId.GetBuddyList:                await HandleGetBuddyListPlainAsync(packet, state, tcp, ct); return true;
             case MediusLobbyMessageId.GetMyClanMessages:           await HandleGetMyClanMessagesAsync(packet, state, tcp, ct); return true;
             case MediusLobbyMessageId.GetAllClanMessages:          await HandleGetAllClanMessagesAsync(packet, state, tcp, ct); return true;
             case MediusLobbyMessageId.SendClanMessage:             await HandleSendClanMessageAsync(packet, state, tcp, ct); return true;
@@ -89,7 +90,7 @@ public partial class MlsServer
     {
         var me = Me(state);
         var buddies = me == null ? new List<MediusAccount>()
-            : me.Buddies.Select(_store.GetAccountById).OfType<MediusAccount>().ToList();
+            : Snapshot(me.Buddies).Select(_store.GetAccountById).OfType<MediusAccount>().ToList();
 
         return SendListAsync(packet, state, tcp, MediusLobbyMessageId.GetBuddyList_ExtraInfoResponse, buddies,
             4 + NameLen + OnlineStateSize, (w, b) =>
@@ -114,8 +115,12 @@ public partial class MlsServer
                 status = MediusCallbackStatus.MediusAccountNotFound;
             else
             {
-                if (add && !me.Buddies.Contains(targetId)) me.Buddies.Add(targetId);
-                if (!add) me.Buddies.Remove(targetId);
+                if (add) AddBuddyLocked(me, target);
+                else
+                {
+                    me.Buddies.Remove(targetId);
+                    target.BuddyRequestsFrom.Remove(me.AccountId);   // withdraw a request they haven't answered
+                }
                 _store.MarkDirty();
                 status = MediusCallbackStatus.MediusSuccess;
             }
@@ -160,7 +165,7 @@ public partial class MlsServer
         var w = new MediusWriter();
         WriteMlsHeader(w, packet, account != null ? MediusCallbackStatus.MediusSuccess : MediusCallbackStatus.MediusAccountNotFound);
         w.Write(account != null ? state.AppId : 0);
-        w.WriteString(account != null ? "SOCOM II" : "", MediusConstants.APPNAME_MAXLEN);
+        w.WriteString(account != null ? _config.ApplicationName : "", MediusConstants.APPNAME_MAXLEN);
         w.Write(0);                                                   // ApplicationType (game)
         w.Write(presence == null ? 0 : presence.GameWorldId != 0 ? presence.GameWorldId : presence.LobbyWorldId);
         w.Write(account?.AccountId ?? 0);
@@ -182,7 +187,7 @@ public partial class MlsServer
     {
         var me = Me(state);
         var ignored = me == null ? new List<MediusAccount>()
-            : me.Ignores.Select(_store.GetAccountById).OfType<MediusAccount>().ToList();
+            : Snapshot(me.Ignores).Select(_store.GetAccountById).OfType<MediusAccount>().ToList();
 
         return SendListAsync(packet, state, tcp, MediusLobbyMessageId.GetIgnoreListResponse, ignored,
             4 + NameLen + 4, (w, a) =>
@@ -338,11 +343,60 @@ public partial class MlsServer
 
     private List<MediusClan> RankedClans(int statIndex, int sortOrder)
     {
-        var ranked = _store.Clans;
+        var ranked = _store.Clans.Where(c => c.LadderStats != null);
         return (sortOrder == (int)MediusSortOrder.MEDIUS_ASCENDING
                 ? ranked.OrderBy(c => StatOf(c.LadderStats, statIndex))
                 : ranked.OrderByDescending(c => StatOf(c.LadderStats, statIndex)))
             .ThenBy(c => c.ClanId).ToList();
+    }
+
+    /// <summary>
+    /// GetClanMemberList (0x90): MessageID | pad3 | ClanID @24 → GetClanMemberListResponse (0x91) rows:
+    /// AccountID | AccountName[32] | Stats[256] | MediusPlayerOnlineState (horizon MediusGetClanMemberListResponse).
+    /// The ExtraInfo variant (0xDA) adds ladder fields; this one used to answer an empty list.
+    /// </summary>
+    private Task HandleGetClanMemberListPlainAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
+    {
+        int clanId = Int(packet.Payload, Pad3Body);
+        var clan = _store.GetClanById(clanId) ?? (Me(state) is { } me ? _store.GetClanById(me.ClanId) : null);
+        var members = clan == null ? new List<MediusAccount>()
+            : Snapshot(clan.Members).Select(_store.GetAccountById).OfType<MediusAccount>()
+                .OrderBy(a => a.AccountId == clan.LeaderAccountId ? 0 : 1).ThenBy(a => a.AccountName).ToList();
+
+        _log.LogInformation("[MLS] GetClanMemberList (plain) clan={Clan} -> {Count}", clanId, members.Count);
+        return SendListAsync(packet, state, tcp, MediusLobbyMessageId.GetClanMemberListResponse, members,
+            4 + NameLen + StatsLen + OnlineStateSize, (w, a) =>
+            {
+                w.Write(a.AccountId);
+                w.WriteString(a.AccountName, NameLen);
+                w.Write(Fixed(a.AccountStats, StatsLen));
+                WriteOnlineState(w, a.AccountId);
+            }, ct);
+    }
+
+    /// <summary>
+    /// GetBuddyList (0x3D, MessageID | SessionKey) → GetBuddyListResponse (0x3E) rows: AccountID | AccountName[32] |
+    /// PlayerStatus (horizon MediusGetBuddyListResponse). SOCOM II itself uses the _ExtraInfo form.
+    /// </summary>
+    private Task HandleGetBuddyListPlainAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
+    {
+        var me = Me(state);
+        var buddies = me == null ? new List<MediusAccount>()
+            : Snapshot(me.Buddies).Select(_store.GetAccountById).OfType<MediusAccount>().ToList();
+
+        return SendListAsync(packet, state, tcp, MediusLobbyMessageId.GetBuddyListResponse, buddies,
+            4 + NameLen + 4, (w, b) =>
+            {
+                w.Write(b.AccountId);
+                w.WriteString(b.AccountName, NameLen);
+                w.Write((int)(_presence.Get(b.AccountId)?.Status ?? MediusPlayerStatus.MediusPlayerDisconnected));
+            }, ct);
+    }
+
+    /// <summary>Copy a social list under <see cref="InMemoryStorage.Sync"/> (its writers hold that lock).</summary>
+    private List<T> Snapshot<T>(List<T> list)
+    {
+        lock (_store.Sync) return list.ToList();
     }
 
     private static int StatOf(int[]? stats, int index) =>
@@ -589,13 +643,14 @@ public partial class MlsServer
         return SendListAsync(packet, state, tcp, MediusLobbyMessageId.CheckMyClanInvitationsResponse, page,
             4 + 4 + 4 + ClanMsgLen + 4 + NameLen, (w, i) =>
             {
-                var clan = _store.GetClanById(i.ClanId)!;
+                // The clan can be disbanded between the filter above and this row being written.
+                var clan = _store.GetClanById(i.ClanId);
                 w.Write(i.InvitationId);
                 w.Write(i.ClanId);
                 w.Write((int)i.Status);
                 w.WriteString(i.Message, ClanMsgLen);
-                w.Write(clan.LeaderAccountId);
-                w.WriteString(_store.GetAccountById(clan.LeaderAccountId)?.AccountName ?? "", NameLen);
+                w.Write(clan?.LeaderAccountId ?? 0);
+                w.WriteString(clan != null ? _store.GetAccountById(clan.LeaderAccountId)?.AccountName ?? "" : "", NameLen);
             }, ct);
     }
 
@@ -698,7 +753,7 @@ public partial class MlsServer
         var clan = _store.GetClanById(clanId) ?? (Me(state) is { } me ? _store.GetClanById(me.ClanId) : null);
         var ranked = RankedPlayers(statIndex, sortOrder);
         var members = clan == null ? new List<MediusAccount>()
-            : clan.Members.Select(_store.GetAccountById).OfType<MediusAccount>()
+            : Snapshot(clan.Members).Select(_store.GetAccountById).OfType<MediusAccount>()
                 .OrderBy(a => a.AccountId == clan.LeaderAccountId ? 0 : 1).ThenBy(a => a.AccountName).ToList();
 
         _log.LogInformation("[MLS] GetClanMemberList clan={Clan} -> {Count}", clanId, members.Count);
@@ -719,9 +774,12 @@ public partial class MlsServer
     private Task HandleGetMyClanMessagesAsync(MediusPacket packet, MediusClientState state, TcpClient tcp, CancellationToken ct)
     {
         var p = packet.Payload;
-        var clan = _store.GetClanById(Int(p, SessionBody)) ?? (Me(state) is { } me ? _store.GetClanById(me.ClanId) : null);
+        // Clan messages are for members: a request for another clan's board gets nothing.
+        var me = Me(state);
+        var requested = _store.GetClanById(Int(p, SessionBody)) ?? (me != null ? _store.GetClanById(me.ClanId) : null);
+        var clan = requested != null && me != null && Snapshot(requested.Members).Contains(me.AccountId) ? requested : null;
         var messages = clan == null ? new List<MediusClanMessage>()
-            : clan.Messages.Where(m => m.Status != MediusClanMessageStatus.ClanMessageDeleted).OrderByDescending(m => m.MessageId).ToList();
+            : Snapshot(clan.Messages).Where(m => m.Status != MediusClanMessageStatus.ClanMessageDeleted).OrderByDescending(m => m.MessageId).ToList();
         var page = Page(messages, Int(p, SessionBody + 4), Int(p, SessionBody + 8));
 
         return SendListAsync(packet, state, tcp, MediusLobbyMessageId.GetMyClanMessagesResponse, page,
@@ -737,7 +795,7 @@ public partial class MlsServer
     {
         var clan = Me(state) is { } me ? _store.GetClanById(me.ClanId) : null;
         var messages = clan == null ? new List<MediusClanMessage>()
-            : clan.Messages.OrderByDescending(m => m.MessageId).ToList();
+            : Snapshot(clan.Messages).OrderByDescending(m => m.MessageId).ToList();
         var page = Page(messages, Int(packet.Payload, SessionBody), Int(packet.Payload, SessionBody + 4));
 
         return SendListAsync(packet, state, tcp, MediusLobbyMessageId.GetAllClanMessagesResponse, page,
@@ -783,7 +841,8 @@ public partial class MlsServer
         lock (_store.Sync)
         {
             var clan = me != null ? _store.GetClanById(me.ClanId) : null;
-            var msg = clan?.Messages.FirstOrDefault(m => m.MessageId == messageId);
+            var msg = clan?.Messages.FirstOrDefault(m => m.MessageId == messageId
+                                                      && m.Status != MediusClanMessageStatus.ClanMessageDeleted);
             if (clan == null)                               status = MediusCallbackStatus.MediusClanNotFound;
             else if (clan.LeaderAccountId != me!.AccountId) status = MediusCallbackStatus.MediusNotClanLeader;
             else if (msg == null)                           status = MediusCallbackStatus.MediusNoResult;

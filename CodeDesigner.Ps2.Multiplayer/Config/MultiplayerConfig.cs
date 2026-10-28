@@ -1,7 +1,38 @@
+using Microsoft.Extensions.Configuration;
+
 namespace CodeDesigner.Ps2.Multiplayer.Config;
 
 public class MultiplayerConfig
 {
+    /// <summary>
+    /// Read the "Online" section (or the legacy "Medius" section when "Online" doesn't exist).
+    /// The configuration binder appends to a list that already has items, so a configured AllowedAppIds of [10472]
+    /// used to become [10683, 10684, 10472], and a configured BriefingRooms list was added after the retail rooms.
+    /// Lists named in the configuration replace their defaults instead.
+    /// </summary>
+    public static MultiplayerConfig Load(IConfiguration configuration)
+    {
+        var section = configuration.GetSection("Online");
+        if (!section.Exists() && configuration.GetSection("Medius").Exists())
+            section = configuration.GetSection("Medius");
+
+        var config = new MultiplayerConfig();
+        section.Bind(config);
+        config.AllowedAppIds = ListOr(section, nameof(AllowedAppIds), new MultiplayerConfig().AllowedAppIds);
+        config.BriefingRooms = ListOr(section, nameof(BriefingRooms), BriefingRoomConfig.RetailDefaults());
+        config.DefaultGames  = ListOr(section, nameof(DefaultGames),  DefaultGameConfig.RetailDefaults());
+        config.Announcements = ListOr(section, nameof(Announcements), new List<string>());
+        return config;
+    }
+
+    /// <summary>The configured list (empty when the key is set to "" or []), or the default when the key is absent.</summary>
+    private static List<T> ListOr<T>(IConfigurationSection section, string key, List<T> defaults)
+    {
+        var child = section.GetSection(key);
+        if (!child.Exists()) return defaults;
+        return child.Get<List<T>>() ?? new List<T>();
+    }
+
     // ── Network ──────────────────────────────────────────────────────────────
 
     /// <summary>IP address to bind to. 0.0.0.0 = all interfaces.</summary>
@@ -27,7 +58,7 @@ public class MultiplayerConfig
     public int MuisPort { get; set; } = 10071;
 
     /// <summary>MAS (Authentication) server TCP port.</summary>
-    public int MasPort { get; set; } = 10073;
+    public int MasPort { get; set; } = 10077;
 
     /// <summary>MLS (Lobby) server TCP port.</summary>
     public int MlsPort { get; set; } = 10075;
@@ -48,6 +79,12 @@ public class MultiplayerConfig
     /// 0 = disabled. Always binds 127.0.0.1, never <see cref="BindAddress"/>.
     /// </summary>
     public int DebugApiPort { get; set; }
+
+    /// <summary>
+    /// Shared secret every debug API request must send as its X-Debug-Token header. Empty = the header is still
+    /// required (it blocks cross-site requests from a browser) but any value is accepted.
+    /// </summary>
+    public string DebugApiToken { get; set; } = "";
 
     // ── DNAS ─────────────────────────────────────────────────────────────────
 
@@ -83,7 +120,7 @@ public class MultiplayerConfig
     /// open resolver that gets abused for DNS amplification, so internet deployments set this false and
     /// unknown names are REFUSED.
     /// </summary>
-    public bool DnsForwardUnknown { get; set; } = true;
+    public bool DnsForwardUnknown { get; set; } = false;
 
     /// <summary>
     /// DNAS region: picks the community TLS certificate (us-gw → cert-us, eu-gw → cert-eu, gai-gw → cert-jp) and is
@@ -128,14 +165,14 @@ public class MultiplayerConfig
 
     // ── Game ─────────────────────────────────────────────────────────────────
 
-    /// <summary>Maximum clients per server before new connections are rejected.</summary>
+    /// <summary>Maximum simultaneous connections per Medius/DME listener; further connections are closed on accept. 0 = no limit.</summary>
     public int MaxClients { get; set; } = 1000;
 
     /// <summary>
-    /// Supported AppIds. SOCOM II NTSC-U = 10683, PAL = 10684.
-    /// Empty list = accept any AppId.
+    /// AppIds allowed to connect (checked at CLIENT_CONNECT_TCP on every Medius/DME listener). SOCOM II NTSC-U
+    /// reports 10472. Empty list (the default) = accept any AppId. A refused console is logged with its AppId.
     /// </summary>
-    public List<int> AllowedAppIds { get; set; } = new() { 10683, 10684 };
+    public List<int> AllowedAppIds { get; set; } = new();
 
     // ── Custom DNS mappings ───────────────────────────────────────────────────
 
@@ -157,8 +194,23 @@ public class MultiplayerConfig
     /// <summary>When true, accounts are auto-created on first login (no separate registration).</summary>
     public bool AutoCreateAccounts { get; set; } = true;
 
-    /// <summary>Client idle timeout in seconds.</summary>
+    /// <summary>
+    /// Seconds a new connection has to finish the SCERT handshake before it is closed. Stops idle sockets that
+    /// never speak from holding a slot. 0 = no limit.
+    /// </summary>
     public int ClientTimeoutSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// Seconds an established connection may go without sending anything before it is closed. In-lobby and
+    /// in-game clients heartbeat on their own, so this only reaps dead or abandoned sessions. 0 = no limit.
+    /// </summary>
+    public int IdleTimeoutSeconds { get; set; } = 900;
+
+    /// <summary>
+    /// Most simultaneous TCP connections one IP address may hold on each Medius/DME listener (a console uses up to
+    /// two per listener). Consoles behind one NAT share an address, so keep headroom. 0 = no limit.
+    /// </summary>
+    public int MaxConnectionsPerIp { get; set; } = 32;
 
     // ── On-screen text / messages ────────────────────────────────────────────
     // Each of these maps to a DIFFERENT screen in the game's online flow. They are
@@ -207,6 +259,15 @@ public class MultiplayerConfig
         "- Servers are up and running.\r\n" +
         "- Be respectful and have fun.\r\n" +
         "- Check back here for the latest news and events.";
+
+    /// <summary>
+    /// Extra in-lobby announcements, shown after <see cref="ServerNews"/> (each one is its own entry in the
+    /// GetAnnouncements list, up to 1000 characters). Empty = ServerNews only.
+    /// </summary>
+    public List<string> Announcements { get; set; } = new();
+
+    /// <summary>Application name returned in FindPlayer / FindWorldByName results.</summary>
+    public string ApplicationName { get; set; } = "SOCOM II";
 
     /// <summary>
     /// Patch level announced in the universe entry (field 0x2B5 = "&lt;version&gt; &lt;url&gt;", split by the client
@@ -282,6 +343,16 @@ public class MultiplayerConfig
     /// to false if login regresses.
     /// </summary>
     public bool CommunityRetailReplies { get; set; } = false;
+
+    /// <summary>
+    /// Apply the filters a console sets with SetGameListFilter0 when building its game list. Off by default: the
+    /// filters are recorded and logged, but every game in the room is listed (the long-standing behaviour). Turn it
+    /// on once the logged filters look right for your game — a wrong match would hide games.
+    /// </summary>
+    public bool ApplyGameListFilters { get; set; } = false;
+
+    /// <summary>Unconfirmed wire-format corrections, each off by default (see <see cref="WireFixesConfig"/>).</summary>
+    public WireFixesConfig WireFixes { get; set; } = new();
 
     // ── Binary injection ──────────────────────────────────────────────────────
 
