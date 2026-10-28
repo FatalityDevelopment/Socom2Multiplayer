@@ -29,8 +29,8 @@ public partial class MlsServer
         var roomStats = rooms.Select(room =>
         {
             var players = online.Where(p => p.State.LobbyWorldId == room.ChannelId).ToList();
-            var games = _store.GetGames(room.AppId)
-                .Where(g => g.LobbyChannelId == room.ChannelId
+            var games = _store.AllGames
+                .Where(g => g.LobbyChannelId == room.ChannelId && g.Status != GameWorldStatus.WorldInactive
                     && g.DmeWorldId is int wid && DmeWorld.GetById(wid) is { } w && w.MediusWorldId == g.GameId)
                 .Select(g => new GameStats(g.GameName, DmeWorld.GetById(g.DmeWorldId!.Value)?.ConnectedCount ?? g.PlayerCount, g.MaxPlayers, g.IsLocked))
                 .ToList();

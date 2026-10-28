@@ -653,6 +653,8 @@ public partial class MlsServer : BaseMediusTcpServer
         return rooms.Select(r =>
         {
             var ch = _store.GetOrCreateChannel(r.WorldId, r.Name, appId, r.MaxPlayers);
+            // The room may have been seeded before any console connected (stats page, debug API) with AppId 0.
+            if (ch.AppId == 0 && appId != 0) ch.AppId = appId;
             ch.SecurityLevel = r.SecurityLevel;
             ch.Password      = r.Password ?? string.Empty;
             ch.GenericField1 = unchecked((int)r.GenericField);

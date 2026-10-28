@@ -128,7 +128,7 @@ public partial class MlsServer
             var players = online.Where(p => p.State.LobbyWorldId == room.ChannelId).ToList();
             sb.AppendLine($"room 0x{room.ChannelId:X} {room.ChannelName}: {players.Count}/{room.MaxPlayers} players");
             foreach (var p in players.OrderBy(p => _store.GetAccountById(p.AccountId)?.AccountName)) sb.AppendLine(Player(p));
-            foreach (var g in _store.GetGames(room.AppId).Where(g => g.LobbyChannelId == room.ChannelId))
+            foreach (var g in _store.AllGames.Where(g => g.LobbyChannelId == room.ChannelId && g.Status != GameWorldStatus.WorldInactive))
             {
                 var w = g.DmeWorldId is int wid ? DmeWorld.GetById(wid) : null;
                 sb.AppendLine($"    game 0x{g.GameId:X} '{g.GameName}' host {g.HostName}: {w?.ConnectedCount ?? g.PlayerCount}/{g.MaxPlayers}" +

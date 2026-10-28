@@ -36,5 +36,9 @@ VOLUME /data
 # DNS (PS2 primary DNS), patch HTTP, DNAS HTTPS, NAT, DME, MUIS, MLS, MAS.
 EXPOSE 53/udp 80/tcp 443/tcp 10069/udp 10070/tcp 10071/tcp 10075/tcp 10077/tcp
 
+# Healthy = the process answers the (log-free) /stats endpoint on the patch HTTP port.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/80 && printf 'GET /stats HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && head -c 12 <&3 | grep -q ' 200'"]
+
 # Runs as root: the PS2 needs the fixed privileged ports 53 (DNS), 80 (patch) and 443 (DNAS).
 ENTRYPOINT ["dotnet", "CodeDesigner.Ps2.Multiplayer.dll"]

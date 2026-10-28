@@ -1,7 +1,37 @@
+using Microsoft.Extensions.Configuration;
+
 namespace CodeDesigner.Ps2.Multiplayer.Config;
 
 public class MultiplayerConfig
 {
+    /// <summary>
+    /// Read the "Online" section (or the legacy "Medius" section when "Online" doesn't exist).
+    /// The configuration binder appends to a list that already has items, so a configured AllowedAppIds of [10472]
+    /// used to become [10683, 10684, 10472], and a configured BriefingRooms list was added after the retail rooms.
+    /// Lists named in the configuration replace their defaults instead.
+    /// </summary>
+    public static MultiplayerConfig Load(IConfiguration configuration)
+    {
+        var section = configuration.GetSection("Online");
+        if (!section.Exists() && configuration.GetSection("Medius").Exists())
+            section = configuration.GetSection("Medius");
+
+        var config = new MultiplayerConfig();
+        section.Bind(config);
+        config.AllowedAppIds = ListOr(section, nameof(AllowedAppIds), new MultiplayerConfig().AllowedAppIds);
+        config.BriefingRooms = ListOr(section, nameof(BriefingRooms), BriefingRoomConfig.RetailDefaults());
+        config.DefaultGames  = ListOr(section, nameof(DefaultGames),  DefaultGameConfig.RetailDefaults());
+        return config;
+    }
+
+    /// <summary>The configured list (empty when the key is set to "" or []), or the default when the key is absent.</summary>
+    private static List<T> ListOr<T>(IConfigurationSection section, string key, List<T> defaults)
+    {
+        var child = section.GetSection(key);
+        if (!child.Exists()) return defaults;
+        return child.Get<List<T>>() ?? new List<T>();
+    }
+
     // ── Network ──────────────────────────────────────────────────────────────
 
     /// <summary>IP address to bind to. 0.0.0.0 = all interfaces.</summary>
@@ -27,7 +57,7 @@ public class MultiplayerConfig
     public int MuisPort { get; set; } = 10071;
 
     /// <summary>MAS (Authentication) server TCP port.</summary>
-    public int MasPort { get; set; } = 10073;
+    public int MasPort { get; set; } = 10077;
 
     /// <summary>MLS (Lobby) server TCP port.</summary>
     public int MlsPort { get; set; } = 10075;
@@ -138,10 +168,10 @@ public class MultiplayerConfig
     public int MaxClients { get; set; } = 1000;
 
     /// <summary>
-    /// Supported AppIds. SOCOM II NTSC-U = 10683, PAL = 10684.
-    /// Empty list = accept any AppId.
+    /// AppIds allowed to connect (checked at CLIENT_CONNECT_TCP on every Medius/DME listener). SOCOM II NTSC-U
+    /// reports 10472. Empty list (the default) = accept any AppId. A refused console is logged with its AppId.
     /// </summary>
-    public List<int> AllowedAppIds { get; set; } = new() { 10683, 10684 };
+    public List<int> AllowedAppIds { get; set; } = new();
 
     // ── Custom DNS mappings ───────────────────────────────────────────────────
 

@@ -1,6 +1,6 @@
 # SOCOM II server on Azure (test deployment)
 
-Runs the server (MUIS, MAS, MLS, DME, NAT, DnaSDK DNAS, DNS) as one container on
+Runs the server (MUIS, MAS, MLS, DME, NAT, DnaSDK DNAS, DNS, patch HTTP) as one container on
 **Azure Container Instances**. ACI is used because the server needs public **UDP** ports (DNS 53, NAT 10069)
 next to its TCP ports on one fixed IP; Azure Container Apps can't expose UDP.
 
@@ -41,17 +41,22 @@ Settings come from `config.json` in the image, overridden by `Online__<Setting>`
 | `Online__ServerIp` | `auto` | Resolved at startup from `Online__PublicHostname` (the group's FQDN). ACI's outbound IP can differ from its inbound IP, so a what's-my-IP lookup would be wrong. |
 | `Online__DnsForwardUnknown` | `false` | Only DNAS/Medius names are answered; everything else is REFUSED, so the public DNS port isn't an open resolver. |
 | `MULTIPLAYER_LOG_FILE` | `none` | Logs go to stdout (`az container logs`), not an ever-growing file. |
-| `Logging__LogLevel__Default` | `Debug` | Full packet hex while testing; deploy with `-LogLevel Information` to quiet it. |
+| `Logging__LogLevel__Default` | `Information` | Deploy with `-LogLevel Debug` for full packet hex while testing. |
+| `Online__DnasRegion` | `us-gw` | `-DnasRegion eu-gw` or `gai-gw` picks that region's gateway certificate and packet region. |
 | `Online__ExternalDnasServer` | empty | Set with `-ExternalDnasServer <ip-or-host>` to send consoles to another DNAS server. The built-in DnaSDK gateway then stays off, and DNS answers `*.dnas.playstation.org` with that server's address. |
 
 ## Test-deployment caveats
 
-- **Persistent data** (accounts, stats, friends/ignore lists, clans, DNAS tickets and DNAS packet logs) lives in `server-data.json` on an Azure Files
-  share mounted at `/data`, so it survives restarts and redeploys. `az group delete` removes it too.
+- **Persistent data** lives on a 5 GiB Azure Files share mounted at `/data`, so it survives restarts and redeploys:
+  accounts, stats, friends/ignore lists and clans in `server-data.json`; DNAS tickets and packet logs under `dnas/`.
+  `az group delete` removes it too.
 - **Patch download**: put the APACHE00.ZDB to serve at `patch/APACHE00.ZDB` on that share. Unpatched (disc r0001)
   consoles download it from `http://<fqdn>:80/_socom2-prod/currentpatch/APACHE00.ZDB` and save it to the memory card.
   Games, briefing-room occupancy and online presence are runtime-only.
-- **The container runs as root** because the console needs the fixed privileged ports 53 and 443.
+- **The container runs as root** because the console needs the fixed privileged ports 53, 80 and 443.
+- **Liveness probe:** ACI restarts the container if the patch server's `/stats` endpoint stops answering.
+- **Image tags:** each run of `deploy-aci.ps1` builds `<commit>-<timestamp>`, so redeploying uncommitted changes
+  ships them. Pass `-ImageTag` to pin one.
 - **Accounts are auto-created** on first login (`AutoCreateAccounts`). Anyone who points a PS2 at the IP can play.
 - **The IP can change** if the container group is deleted and recreated. `az container stop`/`start` normally keeps
   the DNS label, and the server re-resolves its FQDN on every start, but the PS2's DNS setting must match the new IP.

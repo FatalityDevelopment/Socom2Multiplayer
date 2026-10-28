@@ -24,12 +24,16 @@ param containerGroupName string = 'socom2-server'
 param cpuCores int = 1
 param memoryInGb int = 2
 
-@description('Console log level: Debug (full packet hex, useful while testing) or Information.')
+@description('Console log level: Information, or Debug for full packet hex while testing.')
 @allowed([ 'Debug', 'Information', 'Warning' ])
-param logLevel string = 'Debug'
+param logLevel string = 'Information'
 
 @description('Optional external DNAS server (IP or hostname). Empty = DNAS runs in this container.')
 param externalDnasServer string = ''
+
+@description('DNAS region: picks the gateway certificate and the packet region searched first.')
+@allowed([ 'us-gw', 'eu-gw', 'gai-gw' ])
+param dnasRegion string = 'us-gw'
 
 resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
   name: acrName
@@ -50,7 +54,7 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
 
 resource dataShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-01-01' = {
   name: '${storage.name}/default/socom2-data'
-  properties: { shareQuota: 1 }
+  properties: { shareQuota: 5 }   // GiB; DNAS packet logs accumulate under /data/dnas/PacketLogs
 }
 
 var fqdn = '${dnsNameLabel}.${location}.azurecontainer.io'
@@ -105,7 +109,19 @@ resource containerGroup 'Microsoft.ContainerInstance/containerGroups@2023-05-01'
             { name: 'Logging__LogLevel__Default', value: logLevel }
             { name: 'Online__DataDirectory', value: '/data' }
             { name: 'Online__ExternalDnasServer', value: externalDnasServer }
+            { name: 'Online__DnasRegion', value: dnasRegion }
           ]
+          // Restart the container if it stops answering the patch server's /stats endpoint (same check as the
+          // Dockerfile HEALTHCHECK). Generous thresholds: a slow start or a brief stall must not cause a restart loop.
+          livenessProbe: {
+            exec: {
+              command: [ 'bash', '-c', 'exec 3<>/dev/tcp/127.0.0.1/80 && printf "GET /stats HTTP/1.0\\r\\n\\r\\n" >&3 && head -c 12 <&3 | grep -q " 200"' ]
+            }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          }
           volumeMounts: [
             { name: 'data', mountPath: '/data' }
           ]

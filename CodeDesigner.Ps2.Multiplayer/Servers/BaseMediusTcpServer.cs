@@ -605,6 +605,15 @@ public abstract class BaseMediusTcpServer
         _log.LogInformation("[{Name}] CLIENT_CONNECT_TCP (encrypted) AppId={AppId} ver={Ver} world=0x{World:X}",
             ServerName, state.AppId, state.MediusVersion, state.WorldId ?? 0);
 
+        if (_config.AllowedAppIds.Count > 0 && !_config.AllowedAppIds.Contains(state.AppId))
+        {
+            _log.LogWarning("[{Name}] Refusing {Ep}: AppId {AppId} is not in AllowedAppIds [{Allowed}]",
+                ServerName, state.RemoteEndpoint, state.AppId, string.Join(", ", _config.AllowedAppIds));
+            await SendPacketAsync(tcp, ScertPacket.CreateForcedDisconnect(1), state, ct);
+            tcp.Close();
+            return;
+        }
+
         state.ScertId = Interlocked.Increment(ref _scertIdCounter);
         var clientIp = (tcp.Client.RemoteEndPoint as IPEndPoint)?.Address;
 
